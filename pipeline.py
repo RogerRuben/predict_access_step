@@ -1,5 +1,5 @@
 """
-pipeline.py — 支持 train / test 模式
+pipeline.py — 修复报错 + 适配新特征
 """
 import gc
 import os
@@ -30,19 +30,17 @@ log = get_logger()
 
 
 def _find_latest_model(prefix: str, ext: str) -> str:
-    """在 MODEL_DIR 中找到最新的匹配文件。"""
     pattern = os.path.join(MODEL_DIR, f"{prefix}*{ext}")
     files = sorted(glob.glob(pattern))
     if not files:
-        raise FileNotFoundError(f"No saved model matching: {pattern}")
+        raise FileNotFoundError(f"No saved model: {pattern}")
     return files[-1]
 
 
 def _process_day_stage2(day, topo, model, ct_threshold):
-    """单天 Stage 2 处理（使用 keep_extra_for_stage2=True）"""
+    """单天 Stage 2: 分批构建特征(保留 link_id) → 预测 → 聚合难度"""
     head, link, cross = load_day(day)
 
-    # 整天一起构建特征（Stage 2 需要 link_id 等列）
     unique_orders = link["order_id"].unique()
     pred_parts = []
 
@@ -54,7 +52,7 @@ def _process_day_stage2(day, topo, model, ct_threshold):
 
         feat = build_stage1_features_batch(
             link_b, head_b, cross_b, topo,
-            keep_extra_for_stage2=True,
+            keep_extra_for_stage2=True,  # ★ 保留 link_id 等列
         )
         pred = predict_proba(model, feat)
         pred_parts.append(pred)
@@ -81,12 +79,6 @@ def _process_day_stage2(day, topo, model, ct_threshold):
 
 
 def run_pipeline(mode: str = "train"):
-    """
-    Parameters
-    ----------
-    mode : "train" — 完整训练 + 测试
-           "test"  — 加载已保存的模型，仅运行测试
-    """
     topo = load_topology()
 
     if mode == "train":
@@ -105,12 +97,15 @@ def run_pipeline(mode: str = "train"):
             del c
         except FileNotFoundError:
             pass
-    ct_threshold = float(np.percentile(np.concatenate(ct_vals), CROSS_TIME_QUANTILE * 100))
+    if ct_vals:
+        ct_threshold = float(np.percentile(np.concatenate(ct_vals), CROSS_TIME_QUANTILE * 100))
+    else:
+        ct_threshold = 30.0
     del ct_vals
     gc.collect()
     log.info(f"cross_time P{int(CROSS_TIME_QUANTILE*100)} = {ct_threshold:.2f}s")
 
-    # ---- Stage 2: 训练集 ----
+    # ---- Stage 2: Train ----
     if mode == "train":
         log.info("=" * 70)
         log.info("STAGE 2: Difficulty Assessment (Train)")
@@ -132,7 +127,7 @@ def run_pipeline(mode: str = "train"):
         del train_s2_list, train_head_list
         gc.collect()
 
-    # ---- Stage 2: 测试集 ----
+    # ---- Stage 2: Test ----
     log.info("=" * 70)
     log.info("STAGE 2: Difficulty Assessment (Test)")
     log.info("=" * 70)
@@ -164,7 +159,7 @@ def run_pipeline(mode: str = "train"):
 
         diff_model = DifficultyModel()
         diff_model.fit(train_final, train_final["y_tilde"])
-        diff_model.save(tag="v1")
+        diff_model.save(tag="v2")
 
         train_final["difficulty"] = diff_model.predict(train_final)
     else:
@@ -177,10 +172,10 @@ def run_pipeline(mode: str = "train"):
     del test_s2, test_head_slim
     gc.collect()
 
-    diff_model.evaluate(test_final, test_final["y_tilde"])
+    metrics = diff_model.evaluate(test_final, test_final["y_tilde"])
     test_final["difficulty"] = diff_model.predict(test_final)
 
-    # ---- 分级输出 ----
+    # ---- 分级 + 输出 ----
     log.info("=" * 70)
     log.info("RESULTS")
     log.info("=" * 70)
@@ -194,7 +189,12 @@ def run_pipeline(mode: str = "train"):
         q70 = test_final["difficulty"].quantile(0.70)
         q90 = test_final["difficulty"].quantile(0.90)
 
-    for df, name in ([(train_final, "Train")] if train_final is not None else []) + [(test_final, "Test")]:
+    dfs = []
+    if train_final is not None:
+        dfs.append((train_final, "Train"))
+    dfs.append((test_final, "Test"))
+
+    for df, name in dfs:
         df["grade"] = pd.cut(
             df["difficulty"],
             bins=[-np.inf, q30, q70, q90, np.inf],
@@ -202,7 +202,7 @@ def run_pipeline(mode: str = "train"):
         )
         log.info(f"[{name}] Grade distribution:\n{df['grade'].value_counts().sort_index().to_string()}")
 
-    log.info(f"[Test] Mean y_tilde by grade:")
+    log.info("[Test] Mean y_tilde by grade:")
     grade_stats = test_final.groupby("grade", observed=False)["y_tilde"].agg(["mean", "std", "count"])
     log.info(f"\n{grade_stats.to_string()}")
 
@@ -213,7 +213,6 @@ def run_pipeline(mode: str = "train"):
 
 
 def _run_stage1_train(topo):
-    """Stage 1 训练流程。"""
     log.info("=" * 70)
     log.info("STAGE 1: Traffic State Prediction (Training)")
     log.info("=" * 70)
@@ -267,7 +266,7 @@ def _run_stage1_train(topo):
 
     log.info("Training LightGBM ...")
     model = train_model(X_all, y_all)
-    save_stage1_model(model, tag="v1")
+    save_stage1_model(model, tag="v2")
 
     del X_all, y_all
     gc.collect()

@@ -1,5 +1,5 @@
 """
-config.py
+config.py — 改进版
 """
 import os
 
@@ -13,10 +13,9 @@ SPLIT_SUBDIRS = {
     "cross": "cross_split",
 }
 
-# 数据划分
 MISSING_DAYS = {"03"}
-TRAIN_DAYS = [f"{d:02d}" for d in range(4, 7) if f"{d:02d}" not in MISSING_DAYS]
-TEST_DAYS  = ["16"]
+TRAIN_DAYS = [f"{d:02d}" for d in range(4, 6) if f"{d:02d}" not in MISSING_DAYS]
+TEST_DAYS  = ["15"]
 
 # Stage 1
 STATUS_CLASSES = [1, 2, 3, 4]
@@ -29,17 +28,19 @@ LGBM_PARAMS = {
     "num_class": NUM_CLASSES,
     "metric": "multi_logloss",
     "boosting_type": "gbdt",
-    "num_leaves": 63,
-    "learning_rate": 0.05,
+    "num_leaves": 127,          # 63→127: 更强的拟合能力
+    "learning_rate": 0.03,      # 0.05→0.03: 配合更多轮次
     "feature_fraction": 0.8,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
+    "min_child_samples": 100,   # 防过拟合
     "verbose": -1,
     "n_jobs": -1,
     "seed": 42,
+    "is_unbalance": True,       # ★ 内置类别不均衡处理
 }
-LGBM_NUM_ROUNDS = 400
-LGBM_EARLY_STOPPING = 40
+LGBM_NUM_ROUNDS = 800           # 400→800
+LGBM_EARLY_STOPPING = 60       # 40→60
 
 # Stage 2
 CONGESTION_PROB_THRESHOLD = 0.5
@@ -51,7 +52,7 @@ CLUSTER_WINDOW_K = 5
 
 # Stage 3
 DRIVER_SHRINKAGE_PRIOR = 10
-LASSO_ALPHA = 0.01
+Y_TILDE_WINSORIZE = (0.01, 0.99)   # ★ 截断极端值
 
 # 模型保存
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models")

@@ -1,11 +1,10 @@
 """
-stage1_predict.py — 模型保存/加载 + 改进评估指标
+stage1_predict.py — 类别加权 + 改进评估
 """
 import os
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-import joblib
 from datetime import datetime
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -22,23 +21,34 @@ from logger import get_logger
 log = get_logger()
 
 
+def compute_sample_weights(y: np.ndarray) -> np.ndarray:
+    """
+    ★ 计算 inverse-frequency 样本权重。
+    少数类获得更高权重，使 LightGBM 关注拥堵类别。
+    """
+    classes, counts = np.unique(y, return_counts=True)
+    total = len(y)
+    n_classes = len(classes)
+    # sklearn 风格: w_c = total / (n_classes * count_c)
+    weight_map = {c: total / (n_classes * cnt) for c, cnt in zip(classes, counts)}
+
+    log.info(f"Class weights: {', '.join(f's{c+1}={w:.2f}' for c, w in sorted(weight_map.items()))}")
+
+    return np.array([weight_map[yi] for yi in y], dtype="float32")
+
+
 def prepare_training_data(df: pd.DataFrame):
-    """过滤有效样本: arrival_status ∈ {1,2,3,4}（排除 0=未知）"""
     valid = df[df[STAGE1_TARGET].isin(STATUS_CLASSES)].copy()
     valid["label"] = valid[STAGE1_TARGET] - 1
 
     total = len(df)
     n_valid = len(valid)
-    n_status0 = int((df[STAGE1_TARGET] == 0).sum())
+    n_arr0 = int((df[STAGE1_TARGET] == 0).sum())
+    n_cur0 = int(df["is_status_unknown"].sum()) if "is_status_unknown" in df.columns else 0
 
-    log.info(f"Training data: {n_valid:,}/{total:,} valid "
-             f"({n_status0:,} arrival_status=0 excluded)")
+    log.info(f"Training data: {n_valid:,}/{total:,} valid ({n_arr0:,} arrival=0 excluded)")
+    log.info(f"current_status=0: {n_cur0:,}/{total:,} ({n_cur0/max(total,1)*100:.1f}%)")
     log.info(f"Label distribution:\n{valid['label'].value_counts().sort_index().to_string()}")
-
-    # 统计 current_status=0（NaN）的比例
-    n_cur0 = int(df["link_current_status"].isna().sum())
-    log.info(f"current_status=0 (→NaN): {n_cur0:,}/{total:,} "
-             f"({n_cur0/total*100:.1f}%) — handled as missing by LightGBM")
 
     X = valid[STAGE1_FEATURE_COLS].values.astype("float32")
     y = valid["label"].values.astype("int32")
@@ -46,12 +56,18 @@ def prepare_training_data(df: pd.DataFrame):
 
 
 def train_model(X: np.ndarray, y: np.ndarray) -> lgb.Booster:
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X, y, test_size=0.15, random_state=42, stratify=y,
+    # ★ 计算样本权重
+    sample_weights = compute_sample_weights(y)
+
+    X_tr, X_val, y_tr, y_val, w_tr, w_val = train_test_split(
+        X, y, sample_weights,
+        test_size=0.15, random_state=42, stratify=y,
     )
 
-    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=STAGE1_FEATURE_COLS)
-    dval = lgb.Dataset(X_val, label=y_val, feature_name=STAGE1_FEATURE_COLS, reference=dtrain)
+    # ★ 传入权重
+    dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, feature_name=STAGE1_FEATURE_COLS)
+    dval = lgb.Dataset(X_val, label=y_val, weight=w_val,
+                       feature_name=STAGE1_FEATURE_COLS, reference=dtrain)
 
     model = lgb.train(
         LGBM_PARAMS, dtrain,
@@ -64,7 +80,7 @@ def train_model(X: np.ndarray, y: np.ndarray) -> lgb.Booster:
         ],
     )
 
-    # ---- 评估 ----
+    # ---- 评估（不使用权重，反映真实性能）----
     y_val_pred = model.predict(X_val)
     y_val_cls = y_val_pred.argmax(axis=1)
 
@@ -73,32 +89,44 @@ def train_model(X: np.ndarray, y: np.ndarray) -> lgb.Booster:
     wf1 = f1_score(y_val, y_val_cls, average="weighted")
     mf1 = f1_score(y_val, y_val_cls, average="macro")
 
-    # 安全关键指标: 将高拥堵(3/4)误判为低拥堵(1/2)的比例
-    high_actual = (y_val >= 2)  # label 2,3 = status 3,4
+    # ★ 安全关键指标
+    # 危险漏判: 真实 status≥3 (label≥2) 被预测为 status≤2 (label≤1)
+    high_actual = (y_val >= 2)
     if high_actual.sum() > 0:
         dangerous_miss = ((y_val_cls < 2) & high_actual).sum() / high_actual.sum()
     else:
         dangerous_miss = 0.0
 
-    log.info(f"=== Stage 1 Validation ===")
-    log.info(f"  Accuracy:       {acc:.4f}")
-    log.info(f"  Weighted F1:    {wf1:.4f}")
-    log.info(f"  Macro F1:       {mf1:.4f}")
-    log.info(f"  Log Loss:       {ll:.4f}")
-    log.info(f"  Dangerous Miss Rate (status≥3 predicted as ≤2): {dangerous_miss:.4f}")
+    # ★ 4→3 混淆率: 真实 status=4 被预测为 status≤3
+    s4_actual = (y_val == 3)
+    if s4_actual.sum() > 0:
+        s4_underestimate = ((y_val_cls < 3) & s4_actual).sum() / s4_actual.sum()
+    else:
+        s4_underestimate = 0.0
 
-    # 混淆矩阵
+    log.info(f"=== Stage 1 Validation ===")
+    log.info(f"  Accuracy:                {acc:.4f}")
+    log.info(f"  Weighted F1:             {wf1:.4f}")
+    log.info(f"  Macro F1:                {mf1:.4f}")
+    log.info(f"  Log Loss:                {ll:.4f}")
+    log.info(f"  Dangerous Miss (≥3→≤2):  {dangerous_miss:.4f}")
+    log.info(f"  s4 Underestimate (4→≤3): {s4_underestimate:.4f}")
+
+    # 每个类的 recall（最关键指标）
     cm = confusion_matrix(y_val, y_val_cls)
     labels = [f"s{k}" for k in STATUS_CLASSES]
+    for i, label in enumerate(labels):
+        if cm[i].sum() > 0:
+            recall_i = cm[i, i] / cm[i].sum()
+            log.info(f"  Recall {label}: {recall_i:.4f} ({cm[i,i]:,}/{cm[i].sum():,})")
+
     cm_df = pd.DataFrame(cm, index=[f"true_{l}" for l in labels],
                          columns=[f"pred_{l}" for l in labels])
     log.info(f"  Confusion Matrix:\n{cm_df.to_string()}")
 
-    # 分类报告
     report = classification_report(y_val, y_val_cls, target_names=labels, digits=4)
     log.info(f"  Classification Report:\n{report}")
 
-    # 特征重要性
     imp = pd.DataFrame({
         "feature": STAGE1_FEATURE_COLS,
         "importance": model.feature_importance("gain"),
@@ -132,7 +160,6 @@ def predict_proba(model: lgb.Booster, df: pd.DataFrame) -> pd.DataFrame:
         df[f"pred_p{k+1}"] = proba[:, k].astype("float32")
 
     df["pred_status"] = (proba * np.array([[1, 2, 3, 4]])).sum(axis=1).astype("float32")
-
     eps = 1e-10
     df["pred_entropy"] = -(proba * np.log(proba + eps)).sum(axis=1).astype("float32")
     df["pred_cong_prob"] = (proba[:, 2] + proba[:, 3]).astype("float32")
