@@ -1,0 +1,135 @@
+[2026-06-09 11:08:53][INFO] Starting pipeline in 'train' mode
+[2026-06-09 11:08:55][INFO] ======================================================================
+[2026-06-09 11:08:55][INFO] STAGE 1: Traffic State Prediction (Training)
+[2026-06-09 11:08:55][INFO] ======================================================================
+[2026-06-09 11:08:55][INFO] Extracting day 04 ...
+[2026-06-09 11:09:53][INFO]   Day 04: 11,036,500 valid samples
+[2026-06-09 11:09:53][INFO] Extracting day 05 ...
+[2026-06-09 11:11:52][INFO]   Day 05: 21,417,665 valid samples
+[2026-06-09 11:11:52][INFO] Extracting day 06 ...
+[2026-06-09 11:13:48][INFO]   Day 06: 20,952,198 valid samples
+[2026-06-09 11:13:50][INFO] Total training samples: 53,406,363
+[2026-06-09 11:14:02][INFO] Sampled to 37,384,454 (70%)
+[2026-06-09 11:14:02][INFO] Training LightGBM ...
+[2026-06-09 11:25:00][INFO] === Stage 1 Validation ===
+[2026-06-09 11:25:00][INFO]   Accuracy:       0.9621
+[2026-06-09 11:25:00][INFO]   Weighted F1:    0.9547
+[2026-06-09 11:25:00][INFO]   Macro F1:       0.5414
+[2026-06-09 11:25:00][INFO]   Log Loss:       0.1388
+[2026-06-09 11:25:00][INFO]   Dangerous Miss Rate (status≥3 predicted as ≤2): 0.5188
+[2026-06-09 11:25:01][INFO]   Confusion Matrix:
+         pred_s1  pred_s2  pred_s3  pred_s4
+true_s1  5326581    16090    10517     1997
+true_s2   112568    31874     9496     1063
+true_s3    36108     5085    28369     4301
+true_s4     8622      761     5655     8582
+[2026-06-09 11:25:05][INFO]   Classification Report:
+              precision    recall  f1-score   support
+
+          s1     0.9713    0.9947    0.9828   5355185
+          s2     0.5923    0.2056    0.3053    155001
+          s3     0.5250    0.3841    0.4436     73863
+          s4     0.5383    0.3633    0.4338     23620
+
+    accuracy                         0.9621   5607669
+   macro avg     0.6567    0.4869    0.5414   5607669
+weighted avg     0.9531    0.9621    0.9547   5607669
+
+[2026-06-09 11:25:05][INFO]   Feature Importance:
+              feature   importance
+  link_current_status 2.768166e+07
+ upstream_mean_status 1.079723e+07
+            pos_ratio 2.730376e+06
+      cum_travel_time 2.670488e+06
+            cos_slice 2.086573e+06
+            link_time 1.795488e+06
+             link_seq 1.618672e+06
+            sin_slice 1.338064e+06
+        sin_arr_slice 1.331958e+06
+           link_count 1.124602e+06
+         delta_status 1.105751e+06
+        cos_arr_slice 9.431713e+05
+           delta_time 7.173631e+05
+           out_degree 3.791969e+05
+downstream_cross_time 8.188021e+04
+           link_ratio 0.000000e+00
+[2026-06-09 11:25:05][INFO] Stage 1 model saved: D:\pyscript\didi-ETA-DataAnalysisProjects-main\predict_access_step\saved_models\stage1_lgbm_v1_20260609_112505.txt
+[2026-06-09 11:25:06][INFO] Computing global cross_time threshold ...
+[2026-06-09 11:25:07][INFO] cross_time P80 = 30.00s
+[2026-06-09 11:25:07][INFO] ======================================================================
+[2026-06-09 11:25:07][INFO] STAGE 2: Difficulty Assessment (Train)
+[2026-06-09 11:25:07][INFO] ======================================================================
+[2026-06-09 11:25:07][INFO] Stage 2 train day 04 ...
+[2026-06-09 11:30:26][INFO] Stage 2 train day 05 ...
+[2026-06-09 11:46:41][INFO] Stage 2 train day 06 ...
+[2026-06-09 12:02:13][INFO] ======================================================================
+[2026-06-09 12:02:13][INFO] STAGE 2: Difficulty Assessment (Test)
+[2026-06-09 12:02:13][INFO] ======================================================================
+[2026-06-09 12:02:13][INFO] Stage 2 test day 16 ...
+[2026-06-09 12:16:09][INFO] ======================================================================
+[2026-06-09 12:16:09][INFO] STAGE 3: Difficulty Anchoring
+[2026-06-09 12:16:09][INFO] ======================================================================
+[2026-06-09 12:16:09][INFO] Supervision signal: y_raw mean=0.1379 std=0.3265
+[2026-06-09 12:16:09][INFO]                     y_tilde mean=0.0001 std=0.3113
+[2026-06-09 12:16:11][INFO] ElasticNet coefficients (intercept=0.0001):
+          feature  coefficient
+ D2_cong_severity     0.026601
+   U3_unc_persist    -0.022804
+    D7_cross_freq    -0.021230
+  D9_topo_complex    -0.019910
+    D6_hard_cross     0.018282
+  U1_path_entropy     0.014231
+ D1_cong_exposure     0.000000
+  D3_cong_persist    -0.000000
+   D4_status_jump     0.000000
+      D5_coupling    -0.000000
+   D8_cross_share    -0.000000
+ D10_topo_cluster     0.000000
+        D11_night    -0.000000
+U2_high_unc_ratio     0.000000
+            D1xU1    -0.000000
+[2026-06-09 12:16:11][INFO] Train R²=0.0341 MAE=0.1690
+[2026-06-09 12:16:11][INFO] Stage 3 model saved: D:\pyscript\didi-ETA-DataAnalysisProjects-main\predict_access_step\saved_models\stage3_difficulty_v1_20260609_121611.pkl
+[2026-06-09 12:16:11][INFO] Supervision signal: y_raw mean=0.1137 std=0.3357
+[2026-06-09 12:16:11][INFO]                     y_tilde mean=-0.0003 std=0.3152
+[2026-06-09 12:16:11][INFO] Test R²=0.0329 MAE=0.1553 Corr=0.1879
+[2026-06-09 12:16:11][INFO] ======================================================================
+[2026-06-09 12:16:11][INFO] RESULTS
+[2026-06-09 12:16:11][INFO] ======================================================================
+[2026-06-09 12:16:11][INFO] [Train] Grade distribution:
+G1_AV_Easy        238491
+G2_AV_Moderate    317986
+G3_AV_Hard        158994
+G4_HV_Only         79497
+[2026-06-09 12:16:12][INFO] [Test] Grade distribution:
+G1_AV_Easy        107778
+G2_AV_Moderate    123362
+G3_AV_Hard         58669
+G4_HV_Only         26848
+[2026-06-09 12:16:12][INFO] [Test] Mean y_tilde by grade:
+[2026-06-09 12:16:12][INFO] 
+                    mean       std   count
+grade                                     
+G1_AV_Easy     -0.062290  0.199991  107778
+G2_AV_Moderate  0.003950  0.214885  123362
+G3_AV_Hard      0.051253  0.555520   58669
+G4_HV_Only      0.116472  0.300058   26848
+[2026-06-09 12:16:14][INFO] Saved: difficulty_test_day16.csv
+[2026-06-09 12:16:14][INFO] 
+Test sample (15 orders):
+ order_id  D1_cong_exposure  D2_cong_severity  D3_cong_persist  D4_status_jump  D5_coupling  U1_path_entropy  U2_high_unc_ratio  difficulty          grade
+  4515863          0.024773          0.039106         0.000000        6.692582     0.168243         0.343184           0.069615    0.021188     G3_AV_Hard
+  6523257          0.010091          0.022207         0.000000        1.172143     0.032717         0.220746           0.000000   -0.079475     G1_AV_Easy
+  2895890          0.009669          0.018277         0.000000        1.400821     0.044960         0.198938           0.000000   -0.004474 G2_AV_Moderate
+  7299063          0.012121          0.021155         0.211956        2.377869     0.000000         0.196626           0.000748    0.056794     G4_HV_Only
+  3769042          0.018614          0.034772         0.000000        4.326770     0.004349         0.277684           0.038819   -0.015030 G2_AV_Moderate
+  1888546          0.003576          0.006614         0.000000        0.211215     0.009884         0.125549           0.000000   -0.014348 G2_AV_Moderate
+   985540          0.003365          0.005958         0.000000        0.652786     0.014354         0.084749           0.000000   -0.020347 G2_AV_Moderate
+  8112770          0.001224          0.002330         0.000000        0.272445     0.004933         0.069732           0.000000   -0.056781     G1_AV_Easy
+  2990335          0.001102          0.002121         0.000000        0.148813     0.005997         0.046155           0.000000   -0.001536 G2_AV_Moderate
+  8809936          0.006265          0.013078         0.000000        1.146580     0.005877         0.182821           0.000000    0.003183 G2_AV_Moderate
+  3011762          0.114617          0.148562        63.339684        4.363382     0.004860         0.191201           0.000000    0.065315     G4_HV_Only
+  3123086          0.004693          0.007726         0.000000        0.562370     0.005070         0.119428           0.000000   -0.018220 G2_AV_Moderate
+  4837575          0.005229          0.009473         0.000000        1.605769     0.001708         0.148246           0.000000   -0.028069     G1_AV_Easy
+  4344535          0.011703          0.020051         0.000000        1.091563     0.002712         0.285606           0.000000    0.012348 G2_AV_Moderate
+  3888798          0.001440          0.002815         0.000000        0.204774     0.002055         0.073241           0.000000   -0.031055     G1_AV_Easy
