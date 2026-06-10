@@ -54,6 +54,9 @@ CLUSTER_WINDOW_K = 5
 DRIVER_SHRINKAGE_PRIOR = 10
 Y_TILDE_WINSORIZE = (0.01, 0.99)   # ★ 截断极端值
 
+# ★ 新增：Stage 3 使用 float32 还是 float64
+STAGE3_USE_FLOAT64 = False  # False=float32, 节省内存；True=float64, 数值更稳定
+
 # 模型保存
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -83,3 +86,6 @@ COLUMN_RENAME = {
     "link arrival status": "link_arrival_status",
     "simple eta": "simple_eta", "driver id": "driver_id", "slice id": "slice_id",
 }
+# 缓存
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
