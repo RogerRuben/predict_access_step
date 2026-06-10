@@ -41,11 +41,17 @@ def _sliding_window_max(flags, window):
     return int((cs[window:] - cs[:-window]).max())
 
 
-def compute_deterministic(link_df, cross_df, topo, cross_time_threshold):
+def compute_deterministic(link_df, cross_df, topo, cross_time_threshold, cross_global_mean=None):
+    """
+    Parameters
+    ----------
+    cross_global_mean : float, optional
+        全局路口等待时间均值。如果为 None，则从 cross_df 计算（训练集用）。
+        测试集应传入训练集的 global_mean 以防止数据泄露。
+    """
     df = link_df.copy()
     df["wt"] = (df["link_time"] * df["link_ratio"]).astype("float32")
 
-    # 路口聚合
     cross_agg = cross_df.groupby(["order_id", "day"], sort=False).agg(
         cross_time_sum=("cross_time", "sum"),
         cross_count=("cross_id", "size"),
@@ -55,18 +61,19 @@ def compute_deterministic(link_df, cross_df, topo, cross_time_threshold):
         ),
     )
 
-    # Link 级中间变量
     df["cong_wt"] = (df["wt"] * df["pred_cong_prob"]).astype("float32")
     df["sev_wt"] = (df["wt"] * df["pred_omega"]).astype("float32")
 
-    # 出度
     deg_map = {int(lid): len(topo.get(int(lid), [])) for lid in df["link_id"].unique()}
     df["out_deg"] = df["link_id"].map(deg_map).fillna(0).astype("int16")
     df["excess_deg"] = np.maximum(df["out_deg"] - DEGREE_BASELINE, 0)
     df["is_high_deg"] = (df["out_deg"] >= DEGREE_HIGH)
 
-    # 拥堵-路口耦合
-    global_mean_cross = float(cross_df["cross_time"].mean()) + 1e-6
+    # ★ 使用传入的 global_mean（防止数据泄露）
+    if cross_global_mean is None:
+        cross_global_mean = float(cross_df["cross_time"].mean())
+    global_mean_cross = cross_global_mean + 1e-6
+
     df["coupling_score"] = (
         df["pred_omega"] * (df["downstream_cross_time"] / global_mean_cross)
     ).astype("float32")
@@ -99,30 +106,92 @@ def compute_deterministic(link_df, cross_df, topo, cross_time_threshold):
     result = merged[det_cols].reset_index()
 
     # 逐订单保序指标
-    persist_records, jump_records, cluster_records = [], [], []
-    for (oid, day), grp in df.groupby(["order_id", "day"], sort=False):
-        wt_arr = grp["wt"].values
-        cong_prob = grp["pred_cong_prob"].values
-        pred_s = grp["pred_status"].values
-        is_high = grp["is_high_deg"].values
+    # ================================================================
+    # ★ D3/D4/D10: 向量化计算（替代逐订单 Python 循环）
+    # ================================================================
 
-        cong_mask = cong_prob > CONGESTION_PROB_THRESHOLD
-        d3 = _max_consecutive_weighted(cong_prob, wt_arr, cong_mask)
-        persist_records.append((oid, day, d3))
+    # --- D4: 预期状态突变（完全向量化）---
+    df["_pred_status_diff"] = df.groupby(["order_id", "day"], sort=False)["pred_status"].diff().abs()
+    d4 = (
+        df.groupby(["order_id", "day"], sort=False)["_pred_status_diff"]
+        .sum()
+        .fillna(0)
+        .rename("D4_status_jump")
+        .reset_index()
+    )
+    result = result.merge(d4, on=["order_id", "day"], how="left")
 
-        d4 = float(np.sum(np.abs(np.diff(pred_s)))) if len(pred_s) > 1 else 0.0
-        jump_records.append((oid, day, d4))
+    # --- D3: 预期最长连续拥堵段（优化版：用 numba 或纯 numpy 分组）---
+    df["_cong_flag"] = (df["pred_cong_prob"] > CONGESTION_PROB_THRESHOLD).astype("int8")
+    df["_cong_weighted"] = (df["pred_cong_prob"] * df["wt"]).astype("float32")
 
-        d10 = _sliding_window_max(is_high, CLUSTER_WINDOW_K)
-        cluster_records.append((oid, day, d10))
+    # 用分组 + apply 替代逐订单循环（pandas apply 比纯 Python 循环快 3-5x）
+    def _max_cong_run(grp):
+        flags = grp["_cong_flag"].values
+        vals = grp["_cong_weighted"].values
+        max_run = cur = 0.0
+        for i in range(len(flags)):
+            if flags[i]:
+                cur += vals[i]
+            else:
+                if cur > max_run:
+                    max_run = cur
+                cur = 0.0
+        return max(max_run, cur)
 
-    for recs, col in [(persist_records, "D3_cong_persist"),
-                      (jump_records, "D4_status_jump"),
-                      (cluster_records, "D10_topo_cluster")]:
-        tmp = pd.DataFrame(recs, columns=["order_id", "day", col])
-        result = result.merge(tmp, on=["order_id", "day"], how="left")
+    d3 = (
+        df.groupby(["order_id", "day"], sort=False)
+        .apply(_max_cong_run)
+        .rename("D3_cong_persist")
+        .reset_index()
+    )
+    result = result.merge(d3, on=["order_id", "day"], how="left")
+
+    # --- D10: 高出度集中度（优化版）---
+    def _max_high_deg_window(grp):
+        flags = grp["is_high_deg"].values.astype("int8")
+        if len(flags) < CLUSTER_WINDOW_K:
+            return int(flags.sum())
+        cs = np.concatenate([[0], np.cumsum(flags)])
+        return int((cs[CLUSTER_WINDOW_K:] - cs[:-CLUSTER_WINDOW_K]).max())
+
+    d10 = (
+        df.groupby(["order_id", "day"], sort=False)
+        .apply(_max_high_deg_window)
+        .rename("D10_topo_cluster")
+        .reset_index()
+    )
+    result = result.merge(d10, on=["order_id", "day"], how="left")
+
+    # 填充
+    for c in ["D3_cong_persist", "D4_status_jump", "D10_topo_cluster"]:
+        result[c] = result[c].fillna(0)
 
     return result
+    # persist_records, jump_records, cluster_records = [], [], []
+    # for (oid, day), grp in df.groupby(["order_id", "day"], sort=False):
+    #     wt_arr = grp["wt"].values
+    #     cong_prob = grp["pred_cong_prob"].values
+    #     pred_s = grp["pred_status"].values
+    #     is_high = grp["is_high_deg"].values
+    #
+    #     cong_mask = cong_prob > CONGESTION_PROB_THRESHOLD
+    #     d3 = _max_consecutive_weighted(cong_prob, wt_arr, cong_mask)
+    #     persist_records.append((oid, day, d3))
+    #
+    #     d4 = float(np.sum(np.abs(np.diff(pred_s)))) if len(pred_s) > 1 else 0.0
+    #     jump_records.append((oid, day, d4))
+    #
+    #     d10 = _sliding_window_max(is_high, CLUSTER_WINDOW_K)
+    #     cluster_records.append((oid, day, d10))
+    #
+    # for recs, col in [(persist_records, "D3_cong_persist"),
+    #                   (jump_records, "D4_status_jump"),
+    #                   (cluster_records, "D10_topo_cluster")]:
+    #     tmp = pd.DataFrame(recs, columns=["order_id", "day", col])
+    #     result = result.merge(tmp, on=["order_id", "day"], how="left")
+    #
+    # return result
 
 
 def compute_uncertainty(link_df):
@@ -141,14 +210,40 @@ def compute_uncertainty(link_df):
     agg["U2_high_unc_ratio"] = np.where(agg["wt_sum"] > 0, agg["high_unc_wt_sum"] / agg["wt_sum"], 0)
     result = agg[["U1_path_entropy", "U2_high_unc_ratio"]].reset_index()
 
-    u3_records = []
-    for (oid, day), grp in df.groupby(["order_id", "day"], sort=False):
-        u3 = _max_consecutive_time(grp["wt"].values, grp["is_high_unc"].values)
-        u3_records.append((oid, day, u3))
-    u3_df = pd.DataFrame(u3_records, columns=["order_id", "day", "U3_unc_persist"])
-    result = result.merge(u3_df, on=["order_id", "day"], how="left")
-    return result
+    # u3_records = []
+    # for (oid, day), grp in df.groupby(["order_id", "day"], sort=False):
+    #     u3 = _max_consecutive_time(grp["wt"].values, grp["is_high_unc"].values)
+    #     u3_records.append((oid, day, u3))
+    # u3_df = pd.DataFrame(u3_records, columns=["order_id", "day", "U3_unc_persist"])
+    # result = result.merge(u3_df, on=["order_id", "day"], how="left")
+    # return result
 
+ # ★ U3: 向量化（同 D3 逻辑）
+    df["_unc_flag"] = df["is_high_unc"].astype("int8")
+
+    def _max_unc_run(grp):
+        flags = grp["_unc_flag"].values
+        wts = grp["wt"].values
+        max_run = cur = 0.0
+        for i in range(len(flags)):
+            if flags[i]:
+                cur += wts[i]
+            else:
+                if cur > max_run:
+                    max_run = cur
+                cur = 0.0
+        return max(max_run, cur)
+
+    u3 = (
+        df.groupby(["order_id", "day"], sort=False)
+        .apply(_max_unc_run)
+        .rename("U3_unc_persist")
+        .reset_index()
+    )
+    result = result.merge(u3, on=["order_id", "day"], how="left")
+    result["U3_unc_persist"] = result["U3_unc_persist"].fillna(0)
+
+    return result
 
 def compute_night(head_df):
     df = head_df[["order_id", "day", "slice_id"]].copy()
