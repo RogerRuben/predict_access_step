@@ -102,3 +102,22 @@ WRC_LR = 8e-4
 WRC_MAX_SEQ_LEN = 200
 # DataLoader
 num_workers = 2
+
+# ============================================================
+# Stage 1 WDR 安全损失与安全决策
+# ============================================================
+
+# loss 权重
+LOSS_LAMBDA_RISK = 0.50
+LOSS_LAMBDA_FN   = 0.80
+LOSS_LAMBDA_S4   = 0.60
+FOCAL_GAMMA      = 2.0
+
+# 安全阈值（初始值，可后续网格搜索）
+SAFE_TAU_CONG       = 0.22   # P(s3)+P(s4) 超过此值，则按拥堵处理
+SAFE_TAU_RISK       = 0.35   # 风险头概率超过此值，则按拥堵处理
+SAFE_TAU_S4         = 0.12   # P(s4) 超过此值，则直接按 s4
+SAFE_TAU_RISK_HIGH  = 0.70   # 风险头极高，则直接按 s4
+
+# 是否启用安全决策规则
+SAFE_DECISION = True

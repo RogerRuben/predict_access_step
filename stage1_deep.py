@@ -1,10 +1,12 @@
 """
-stage1_deep.py — WDR 创新架构完整版
-适配 pipeline.py 的完整调用链路
-
-创新点：
-1. 时空衰减闸门残差传递结构 (Spatiotemporal Decay Gate)
-2. 状态-不确定性风险多任务自对齐损失 (Multi-task Alignment Loss)
+stage1_deep.py — 完整版
+Safety-Aware WDR (Wide-Deep-Recurrent) with:
+  1. 时空衰减闸门残差传递结构 (Spatiotemporal Decay Gate)
+  2. 安全感知多任务损失 (Safety-Aware Multi-Task Loss)
+  3. 安全阈值决策规则 (Safety Decision Rule)
+  4. 逐 shard 流式训练 + checkpoint + OneCycleLR
+  5. AMP 混合精度
+  6. 后台 shard 预取
 """
 
 import os
@@ -15,20 +17,27 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 from datetime import datetime
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
-from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    accuracy_score, f1_score,
+    confusion_matrix, classification_report,
+)
+
 from config import (
     MODEL_DIR, NUM_CLASSES, STATUS_CLASSES,
     WRC_HIDDEN_DIM, WRC_NUM_LAYERS, WRC_BATCH_SIZE,
-    WRC_EPOCHS, WRC_LR, WRC_MAX_SEQ_LEN
+    WRC_EPOCHS, WRC_LR, WRC_MAX_SEQ_LEN,
+    FOCAL_GAMMA,
+    LOSS_LAMBDA_RISK, LOSS_LAMBDA_FN, LOSS_LAMBDA_S4,
+    SAFE_TAU_CONG, SAFE_TAU_RISK,
+    SAFE_TAU_S4, SAFE_TAU_RISK_HIGH,
 )
 from feature_eng import STAGE1_FEATURE_COLS
 from stage1_dataset import (
-
     split_train_val_shards,
     load_stats,
     SingleShardSequenceDataset,
@@ -37,15 +46,15 @@ from stage1_dataset import (
 )
 from logger import get_logger
 
-
 log = get_logger()
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 时空特征在 STAGE1_FEATURE_COLS 中的索引（预计算，避免重复查找）
 ST_FEATURE_NAMES = ["pos_ratio", "cum_travel_time", "sin_arr_slice", "cos_arr_slice"]
 ST_INDICES = [STAGE1_FEATURE_COLS.index(n) for n in ST_FEATURE_NAMES]
+
 CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 
 # ================================================================
 # 1. 创新组件：动态时空衰减闸门
@@ -53,12 +62,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 class SpatiotemporalDecayGate(nn.Module):
     """
-    创新点 1：动态时空衰减闸门。
     从序列特征中剥离时空维度，自适应计算历史记忆的过时衰减权重。
-
-    物理含义：
-    - 路径越靠后（pos_ratio 大）、累计行驶时间越长，出发时的路况信息越过时
-    - 该门控机制动态决定"保留多少历史记忆 / 引入多少当前观测"
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -69,40 +73,24 @@ class SpatiotemporalDecayGate(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(
-        self,
-        rnn_step: torch.Tensor,   # (B, H) 当前步 LSTM 输出
-        st_step: torch.Tensor,    # (B, 4) 当前步时空特征
-        h_prev: torch.Tensor,     # (B, H) 上一步调制后隐状态
-    ) -> torch.Tensor:
-        decay = self.gate(st_step)                              # (B, H) 0~1
-        h_mod = (1.0 - decay) * h_prev + decay * rnn_step      # 残差调制
-        return h_mod
+    def forward(self, rnn_step, st_step, h_prev):
+        decay = self.gate(st_step)
+        return (1.0 - decay) * h_prev + decay * rnn_step
 
 
 # ================================================================
-# 2. 核心 WDR 网络
+# 2. WDR 网络
 # ================================================================
 
 class CustomWDRNet(nn.Module):
-    """
-    Wide-Deep-Recurrent + 时空衰减闸门 + 多任务输出头
-
-    输出：
-      traffic_logits: (B, T, NUM_CLASSES)   —— 路况分类
-      risk_preds:     (B, T, 1)              —— 拥堵风险回归
-    """
-
     def __init__(self, dense_dim: int, hidden_dim: int = 64, num_layers: int = 2):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.dense_dim = dense_dim
 
-        # Wide：直接线性映射，提供即时强特征
         self.wide = nn.Linear(dense_dim, hidden_dim)
 
-        # Deep：MLP 挖掘非线性泛化特征
         self.deep = nn.Sequential(
             nn.Linear(dense_dim, hidden_dim),
             nn.ReLU(),
@@ -111,7 +99,6 @@ class CustomWDRNet(nn.Module):
             nn.ReLU(),
         )
 
-        # Recurrent：LSTM 序列骨干
         self.lstm = nn.LSTM(
             input_size=dense_dim,
             hidden_size=hidden_dim,
@@ -120,192 +107,183 @@ class CustomWDRNet(nn.Module):
             dropout=0.1 if num_layers > 1 else 0.0,
         )
 
-        # 时空衰减闸门
         self.decay_gate = SpatiotemporalDecayGate(hidden_dim)
 
-        # 多任务输出头
-        fusion_dim = hidden_dim * 3     # wide + deep + recurrent
+        fusion_dim = hidden_dim * 3
+
         self.traffic_head = nn.Sequential(
             nn.Linear(fusion_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, NUM_CLASSES),
         )
+
         self.risk_head = nn.Sequential(
             nn.Linear(fusion_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),               # 输出 [0,1] 对应拥堵风险
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,           # (B, T, dense_dim)
-        lengths: torch.Tensor,     # (B,)
-        st_info: torch.Tensor,     # (B, T, 4)
-    ):
+    def forward(self, x, lengths, st_info):
         B, T, D = x.shape
 
-        # LSTM（使用 pack_padded_sequence 处理变长序列）
-        packed = nn.utils.rnn.pack_padded_sequence(
+        packed = pack_padded_sequence(
             x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
         packed_out, _ = self.lstm(packed)
-        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+        lstm_out, _ = pad_packed_sequence(
             packed_out, batch_first=True, total_length=T
-        )                                                       # (B, T, H)
+        )
 
-        # 时空衰减闸门逐步调制
         h_prev = torch.zeros(B, self.hidden_dim, device=x.device)
         steps = []
         for t in range(T):
             h_prev = self.decay_gate(lstm_out[:, t, :], st_info[:, t, :], h_prev)
             steps.append(h_prev.unsqueeze(1))
-        decay_out = torch.cat(steps, dim=1)                     # (B, T, H)
+        decay_out = torch.cat(steps, dim=1)
 
-        # 平铺 → Wide & Deep
         x_flat = x.reshape(B * T, D)
         wide_out = self.wide(x_flat).reshape(B, T, self.hidden_dim)
         deep_out = self.deep(x_flat).reshape(B, T, self.hidden_dim)
 
-        # 融合
         fused = torch.cat(
             [wide_out, deep_out, lstm_out + decay_out], dim=-1
-        )                                                       # (B, T, H*3)
+        )
 
-        traffic_logits = self.traffic_head(fused)               # (B, T, C)
-        risk_preds = self.risk_head(fused)                      # (B, T, 1)
+        traffic_logits = self.traffic_head(fused)
+        risk_logits = self.risk_head(fused)
 
-        return traffic_logits, risk_preds
+        return traffic_logits, risk_logits
 
 
 # ================================================================
-# 3. 损失函数
+# 3. Safety-Aware Multi-Task Loss
 # ================================================================
 
-class MultiTaskAlignmentLoss(nn.Module):
+class SafetyAwareMultiTaskLoss(nn.Module):
     """
-    创新点 2：多任务自对齐损失
-
-    Loss = CE(traffic) + λ * MSE(risk_pred, stop_probability_proxy)
-
-    stop_probability_proxy（无梯度）：
-      = P(s3) + P(s4) from traffic_logits
-      —— 强迫 risk_head 的表征空间对拥堵类别高度敏感
+    安全感知多任务损失:
+      1) focal classification loss          (四分类主任务)
+      2) binary risk BCE loss               (拥堵风险辅助: 用真实标签监督)
+      3) false-negative penalty             (抑制 s3/s4 → s1/s2 漏判)
+      4) extreme-congestion preservation    (抑制 s4 → 非s4 降级)
     """
 
-    def __init__(self, risk_weight: float = 0.3, ignore_index: int = -1):
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction="mean")
-        self.mse = nn.MSELoss(reduction="mean")
-        self.risk_weight = risk_weight
-        self.ignore_index = ignore_index
-
-    def forward(
+    def __init__(
         self,
-        traffic_logits: torch.Tensor,   # (B, T, C)
-        risk_preds: torch.Tensor,        # (B, T, 1)
-        targets: torch.Tensor,           # (B, T)
+        alpha_cls,
+        risk_pos_weight=4.0,
+        gamma=2.0,
+        lambda_risk=0.5,
+        lambda_fn=0.8,
+        lambda_s4=0.6,
+        ignore_index=-1,
     ):
+        super().__init__()
+        self.alpha_cls = torch.tensor(alpha_cls, dtype=torch.float32)
+        self.gamma = gamma
+        self.lambda_risk = lambda_risk
+        self.lambda_fn = lambda_fn
+        self.lambda_s4 = lambda_s4
+        self.ignore_index = ignore_index
+        self.risk_pos_weight = torch.tensor([risk_pos_weight], dtype=torch.float32)
+
+    def focal_ce(self, logits, targets):
+        probs = F.softmax(logits, dim=-1)
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1).clamp_min(1e-8)
+        alpha = self.alpha_cls.to(logits.device)[targets]
+        loss = -alpha * ((1 - pt) ** self.gamma) * torch.log(pt)
+        return loss.mean()
+
+    def forward(self, traffic_logits, risk_logits, targets):
         B, T, C = traffic_logits.shape
 
-        # 交叉熵损失
-        loss_ce = self.ce(traffic_logits.reshape(B * T, C), targets.reshape(B * T))
+        logits_flat = traffic_logits.reshape(B * T, C)
+        risk_flat = risk_logits.reshape(B * T)
+        y_flat = targets.reshape(B * T)
 
-        # 自对齐 risk target（无梯度）
-        with torch.no_grad():
-            probs = F.softmax(traffic_logits, dim=-1)
-            risk_target = (probs[:, :, 2] + probs[:, :, 3]).unsqueeze(-1)  # (B, T, 1)
+        valid = y_flat != self.ignore_index
+        logits_flat = logits_flat[valid]
+        risk_flat = risk_flat[valid]
+        y_flat = y_flat[valid]
 
-        # 只在非 padding 位置计算
-        mask = (targets != self.ignore_index).float().unsqueeze(-1)
-        loss_risk = self.mse(risk_preds * mask, risk_target * mask)
+        if len(y_flat) == 0:
+            zero = traffic_logits.sum() * 0.0
+            return zero, zero, zero, zero, zero
 
-        return loss_ce + self.risk_weight * loss_risk, loss_ce, loss_risk
+        # (1) 四分类 focal loss
+        loss_cls = self.focal_ce(logits_flat, y_flat)
 
-
-# ================================================================
-# 4. 评估
-# ================================================================
-
-def evaluate_wrc(model: CustomWDRNet, loader, device, verbose=False, use_tqdm=False):
-    """
-    验证集评估。只用 traffic_logits 计算分类指标。
-    """
-    model.eval()
-    criterion = MultiTaskAlignmentLoss()
-
-    all_preds, all_labels = [], []
-    total_loss = 0.0
-    n_batches = 0
-
-    iterator = tqdm(loader, desc="[valid]", leave=False, dynamic_ncols=True) if use_tqdm else loader
-
-    with torch.no_grad():
-        for X_b, y_b, lens_b in iterator:
-            X_b = X_b.to(device, non_blocking=True)
-            y_b = y_b.to(device, non_blocking=True)
-            lens_b = lens_b.to(device)
-
-            st_b = X_b[:, :, ST_INDICES]
-
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                logits, risk = model(X_b, lens_b, st_b)
-                loss, _, _ = criterion(logits, risk, y_b)
-
-            total_loss += float(loss.item())
-            n_batches += 1
-
-            preds = logits.argmax(dim=-1)
-            for b in range(len(lens_b)):
-                L = lens_b[b].item()
-                all_preds.extend(preds[b, :L].cpu().numpy())
-                all_labels.extend(y_b[b, :L].cpu().numpy())
-
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
-    mask = y_true >= 0
-    y_true, y_pred = y_true[mask], y_pred[mask]
-
-    acc      = accuracy_score(y_true, y_pred)
-    macro_f1 = f1_score(y_true, y_pred, average="macro")
-
-    high_actual = y_true >= 2
-    dmr = float((y_pred < 2)[high_actual].sum() / max(high_actual.sum(), 1))
-
-    s4_actual = y_true == 3
-    s4_under = float((y_pred < 3)[s4_actual].sum() / max(s4_actual.sum(), 1))
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])
-    recalls = [cm[i, i] / max(cm[i].sum(), 1) for i in range(4)]
-
-    if verbose:
-        labels_str = [f"s{k}" for k in STATUS_CLASSES]
-        cm_df = pd.DataFrame(
-            cm,
-            index=[f"true_{l}" for l in labels_str],
-            columns=[f"pred_{l}" for l in labels_str],
+        # (2) 风险头 BCE（用真实标签: s3/s4=1, s1/s2=0）
+        risk_target = (y_flat >= 2).float()
+        pos_weight = self.risk_pos_weight.to(risk_flat.device)
+        loss_risk = F.binary_cross_entropy_with_logits(
+            risk_flat, risk_target, pos_weight=pos_weight, reduction="mean",
         )
-        log.info(f"Confusion Matrix:\n{cm_df.to_string()}")
-        log.info(f"\n{classification_report(y_true, y_pred, target_names=labels_str, digits=4)}")
-        for i, l in enumerate(labels_str):
-            log.info(f"  Recall {l}: {recalls[i]:.4f}")
-        log.info(f"  Dangerous Miss Rate (≥3→≤2): {dmr:.4f}")
-        log.info(f"  s4 Underestimate   (4→≤3):   {s4_under:.4f}")
 
-    return {
-        "loss": total_loss / max(n_batches, 1),
-        "accuracy": acc,
-        "macro_f1": macro_f1,
-        "dangerous_miss": dmr,
-        "s4_underestimate": s4_under,
-        "recall_per_class": recalls,
-    }
+        # (3) 漏判惩罚：真实 s3/s4 时, 要求 p_cong 高
+        probs = F.softmax(logits_flat, dim=-1)
+        p_cong = (probs[:, 2] + probs[:, 3]).clamp_min(1e-8)
+        risky_mask = (y_flat >= 2).float()
+        if risky_mask.sum() > 0:
+            loss_fn = (-(torch.log(p_cong)) * risky_mask).sum() / risky_mask.sum()
+        else:
+            loss_fn = loss_cls.new_tensor(0.0)
+
+        # (4) s4 保留惩罚：真实 s4 时, 要求 p4 高
+        p_s4 = probs[:, 3].clamp_min(1e-8)
+        severe_mask = (y_flat == 3).float()
+        if severe_mask.sum() > 0:
+            loss_s4 = (-(torch.log(p_s4)) * severe_mask).sum() / severe_mask.sum()
+        else:
+            loss_s4 = loss_cls.new_tensor(0.0)
+
+        total = (
+            loss_cls
+            + self.lambda_risk * loss_risk
+            + self.lambda_fn * loss_fn
+            + self.lambda_s4 * loss_s4
+        )
+
+        return total, loss_cls, loss_risk, loss_fn, loss_s4
 
 
-# ============================================================
-# GPU 日志
-# ============================================================
+# ================================================================
+# 4. 安全决策规则
+# ================================================================
+
+def safety_decision_rule(traffic_logits, risk_logits):
+    """
+    安全阈值决策:
+      1. P(s4) >= τ_s4 or risk >= τ_risk_high → 直接 s4
+      2. P(s3)+P(s4) >= τ_cong or risk >= τ_risk → s3/s4 择大
+      3. 否则 s1/s2 择大
+    """
+    probs = F.softmax(traffic_logits, dim=-1)
+    risk_prob = torch.sigmoid(risk_logits).squeeze(-1)
+
+    p1, p2, p3, p4 = probs[:, :, 0], probs[:, :, 1], probs[:, :, 2], probs[:, :, 3]
+    p_cong = p3 + p4
+
+    pred_low = torch.where(p2 > p1, torch.ones_like(p1, dtype=torch.long),
+                           torch.zeros_like(p1, dtype=torch.long))
+    pred_high = torch.where(p4 > p3, torch.full_like(pred_low, 3),
+                            torch.full_like(pred_low, 2))
+
+    pred = pred_low.clone()
+
+    cong_mask = (p_cong >= SAFE_TAU_CONG) | (risk_prob >= SAFE_TAU_RISK)
+    pred[cong_mask] = pred_high[cong_mask]
+
+    severe_mask = (p4 >= SAFE_TAU_S4) | (risk_prob >= SAFE_TAU_RISK_HIGH)
+    pred[severe_mask] = 3
+
+    return pred, probs, risk_prob
+
+
+# ================================================================
+# 5. GPU / Checkpoint 工具
+# ================================================================
 
 def log_gpu_memory(prefix=""):
     if torch.cuda.is_available():
@@ -315,26 +293,14 @@ def log_gpu_memory(prefix=""):
         log.info(f"{prefix}[GPU] alloc={a:.2f}GB reserved={r:.2f}GB peak={p:.2f}GB")
 
 
-# ============================================================
-# Checkpoint
-# ============================================================
-
-def save_training_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    scaler,
-    epoch,
-    best_dmr,
-    best_macro_f1,
-    ckpt_path,
-):
+def save_training_checkpoint(model, optimizer, scheduler, scaler, epoch,
+                             best_dmr, best_macro_f1, ckpt_path):
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
-        "scaler_state": scaler.state_dict() if scaler is not None else None,
+        "scheduler_state": scheduler.state_dict() if scheduler else None,
+        "scaler_state": scaler.state_dict() if scaler else None,
         "best_dmr": best_dmr,
         "best_macro_f1": best_macro_f1,
         "dense_dim": model.dense_dim,
@@ -350,13 +316,61 @@ def load_training_checkpoint(ckpt_path, device):
     return ckpt
 
 
-# ============================================================
-# 验证：逐 shard 聚合
-# ============================================================
+# ================================================================
+# 6. 类别分布估计
+# ================================================================
 
-def evaluate_wrc_on_shards(model, shard_infos, device, batch_size=256, max_seq_len=100, verbose=False):
+def estimate_label_distribution_from_shards(train_shards, max_shards=5):
+    counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+
+    for shard_info in train_shards[:max_shards]:
+        shard = torch.load(shard_info["path"], map_location="cpu")
+        for y in shard["y_list"]:
+            y = np.asarray(y)
+            y = y[(y >= 0) & (y < NUM_CLASSES)]
+            counts += np.bincount(y, minlength=NUM_CLASSES)
+        del shard
+        gc.collect()
+
+    counts = np.maximum(counts, 1)
+    total = counts.sum()
+
+    alpha_cls = total / (NUM_CLASSES * counts.astype(float))
+    alpha_cls[0] = np.sqrt(alpha_cls[0])
+    alpha_cls[1:] = np.clip(alpha_cls[1:] * 1.5, 1.0, 20.0)
+    alpha_cls = np.clip(alpha_cls, 0.5, 20.0).astype(np.float32)
+
+    pos = counts[2] + counts[3]
+    neg = counts[0] + counts[1]
+    risk_pos_weight = float(neg / max(pos, 1))
+
+    log.info(f"Class counts: {counts.tolist()}")
+    log.info(f"alpha_cls: {alpha_cls.round(3).tolist()}")
+    log.info(f"risk_pos_weight: {risk_pos_weight:.3f}")
+
+    return alpha_cls, risk_pos_weight
+
+
+# ================================================================
+# 7. 验证：逐 shard 聚合 + 安全决策
+# ================================================================
+
+def evaluate_wrc_on_shards(model, shard_infos, device,
+                           batch_size=256, max_seq_len=100,
+                           verbose=False):
     model.eval()
-    criterion = MultiTaskAlignmentLoss(risk_weight=0.3, ignore_index=-1)
+
+    alpha_cls, risk_pw = estimate_label_distribution_from_shards(
+        shard_infos, max_shards=min(3, len(shard_infos))
+    )
+    criterion = SafetyAwareMultiTaskLoss(
+        alpha_cls=alpha_cls,
+        risk_pos_weight=risk_pw,
+        gamma=FOCAL_GAMMA,
+        lambda_risk=LOSS_LAMBDA_RISK,
+        lambda_fn=LOSS_LAMBDA_FN,
+        lambda_s4=LOSS_LAMBDA_S4,
+    )
 
     all_preds, all_labels = [], []
     total_loss = 0.0
@@ -371,11 +385,8 @@ def evaluate_wrc_on_shards(model, shard_infos, device, batch_size=256, max_seq_l
 
         ds = SingleShardSequenceDataset(shard_obj, max_seq_len=max_seq_len)
         loader = DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=0,                     # Windows 下这里建议 0，避免 worker 启动开销
+            ds, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_fn, num_workers=0,
             pin_memory=(device.type == "cuda"),
         )
 
@@ -384,20 +395,20 @@ def evaluate_wrc_on_shards(model, shard_infos, device, batch_size=256, max_seq_l
                 X_b = X_b.to(device, non_blocking=True)
                 y_b = y_b.to(device, non_blocking=True)
                 lens_b = lens_b.to(device)
-
                 st_b = X_b[:, :, ST_INDICES]
 
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    logits, risk = model(X_b, lens_b, st_b)
-                    loss, _, _ = criterion(logits, risk, y_b)
+                    logits, risk_logits = model(X_b, lens_b, st_b)
+                    loss, _, _, _, _ = criterion(logits, risk_logits, y_b)
 
                 total_loss += float(loss.item())
                 n_batches += 1
 
-                preds = logits.argmax(dim=-1)
+                pred_cls, _, _ = safety_decision_rule(logits, risk_logits)
+
                 for b in range(len(lens_b)):
                     L = lens_b[b].item()
-                    all_preds.extend(preds[b, :L].cpu().numpy())
+                    all_preds.extend(pred_cls[b, :L].cpu().numpy())
                     all_labels.extend(y_b[b, :L].cpu().numpy())
 
         del ds, loader, shard_obj
@@ -446,9 +457,9 @@ def evaluate_wrc_on_shards(model, shard_infos, device, batch_size=256, max_seq_l
     }
 
 
-# ============================================================
-# 训练：逐 shard 流式 + checkpoint + OneCycleLR
-# ============================================================
+# ================================================================
+# 8. 训练主函数
+# ================================================================
 
 def train_wrc_from_shards(
     hidden_dim=WRC_HIDDEN_DIM,
@@ -464,24 +475,32 @@ def train_wrc_from_shards(
         device = DEVICE
 
     log.info("=" * 70)
-    log.info("WDR Streaming Training from Shards")
+    log.info("WDR Safety-Aware Streaming Training")
     log.info("=" * 70)
     log.info(
         f"device={device} | hidden={hidden_dim} | layers={num_layers} | "
         f"batch={batch_size} | lr={lr} | max_seq_len={max_seq_len} | epochs={epochs}"
     )
+    log.info(
+        f"Loss weights: risk={LOSS_LAMBDA_RISK} fn={LOSS_LAMBDA_FN} s4={LOSS_LAMBDA_S4} | "
+        f"Thresholds: cong={SAFE_TAU_CONG} risk={SAFE_TAU_RISK} s4={SAFE_TAU_S4} risk_high={SAFE_TAU_RISK_HIGH}"
+    )
 
-    # metadata
     mean_dict, std_dict, feature_cols = load_stats()
     train_shards, val_shards, _ = split_train_val_shards(val_ratio=0.15, seed=42)
 
     log.info(f"Train shards: {len(train_shards)} | Val shards: {len(val_shards)}")
 
-    # 估算总 step（供 OneCycleLR）
+    # 估算 step 数
     total_train_orders = sum(s["n_orders"] for s in train_shards)
     steps_per_epoch = math.ceil(total_train_orders / batch_size)
     total_steps = epochs * steps_per_epoch
-    log.info(f"Approx. steps_per_epoch={steps_per_epoch} | total_steps={total_steps}")
+    log.info(f"steps_per_epoch≈{steps_per_epoch} | total_steps≈{total_steps}")
+
+    # 类别分布
+    alpha_cls, risk_pos_weight = estimate_label_distribution_from_shards(
+        train_shards, max_shards=min(5, len(train_shards))
+    )
 
     # 模型
     model = CustomWDRNet(
@@ -493,30 +512,36 @@ def train_wrc_from_shards(
     log.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
     log_gpu_memory("Init ")
 
-    criterion = MultiTaskAlignmentLoss(risk_weight=0.3, ignore_index=-1)
+    criterion = SafetyAwareMultiTaskLoss(
+        alpha_cls=alpha_cls,
+        risk_pos_weight=risk_pos_weight,
+        gamma=FOCAL_GAMMA,
+        lambda_risk=LOSS_LAMBDA_RISK,
+        lambda_fn=LOSS_LAMBDA_FN,
+        lambda_s4=LOSS_LAMBDA_S4,
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # ★ 动态学习率：OneCycleLR（按 batch 调整）
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=lr,
         total_steps=total_steps,
         pct_start=0.1,
         anneal_strategy="cos",
-        div_factor=10.0,        # 初始 lr = max_lr / 10
+        div_factor=10.0,
         final_div_factor=100.0,
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", f"wdr_stream_{ts}")
+    tb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", f"wdr_safe_{ts}")
     writer = SummaryWriter(log_dir=tb_dir)
     log.info(f"TensorBoard: tensorboard --logdir {tb_dir}")
-    log.info("             Then open http://localhost:6006")
 
     latest_ckpt = os.path.join(CHECKPOINT_DIR, "wdr_latest.pt")
-    best_ckpt   = os.path.join(CHECKPOINT_DIR, "wdr_best.pt")
+    best_ckpt = os.path.join(CHECKPOINT_DIR, "wdr_best.pt")
 
     start_epoch = 0
     best_dmr = 1.0
@@ -526,14 +551,16 @@ def train_wrc_from_shards(
     early_stop_patience = 2
     no_improve_epochs = 0
 
-    # resume
     if resume and os.path.exists(latest_ckpt):
         ckpt = load_training_checkpoint(latest_ckpt, device)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
-        if ckpt["scheduler_state"] is not None:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
-        if ckpt["scaler_state"] is not None:
+        if ckpt["scheduler_state"]:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+            except Exception:
+                log.warning("Scheduler state incompatible, re-initializing")
+        if ckpt["scaler_state"]:
             scaler.load_state_dict(ckpt["scaler_state"])
         start_epoch = ckpt["epoch"] + 1
         best_dmr = ckpt["best_dmr"]
@@ -545,6 +572,8 @@ def train_wrc_from_shards(
         train_loss = 0.0
         train_ce = 0.0
         train_risk = 0.0
+        train_fn = 0.0
+        train_s4 = 0.0
         n_batches = 0
 
         epoch_shards = train_shards.copy()
@@ -561,21 +590,17 @@ def train_wrc_from_shards(
                 break
 
             shard_counter += 1
-            log.info(f"  Train shard {shard_counter}/{len(epoch_shards)}: {os.path.basename(shard_info['path'])}")
 
             ds = SingleShardSequenceDataset(shard_obj, max_seq_len=max_seq_len)
             loader = DataLoader(
-                ds,
-                batch_size=batch_size,
-                shuffle=True,
-                collate_fn=collate_fn,
-                num_workers=0,                     # Windows 建议 0，减少 worker 初始化停顿
+                ds, batch_size=batch_size, shuffle=True,
+                collate_fn=collate_fn, num_workers=0,
                 pin_memory=(device.type == "cuda"),
             )
 
             pbar = tqdm(
                 loader,
-                desc=f"Epoch {epoch+1:>2} Shard {shard_counter:>3}",
+                desc=f"E{epoch+1} S{shard_counter:>3}/{len(epoch_shards)}",
                 leave=False,
                 dynamic_ncols=True,
                 unit="batch",
@@ -585,17 +610,20 @@ def train_wrc_from_shards(
                 X_b = X_b.to(device, non_blocking=True)
                 y_b = y_b.to(device, non_blocking=True)
                 lens_b = lens_b.to(device)
-
                 st_b = X_b[:, :, ST_INDICES]
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    logits, risk = model(X_b, lens_b, st_b)
-                    loss, loss_ce, loss_risk = criterion(logits, risk, y_b)
+                    logits, risk_logits = model(X_b, lens_b, st_b)
+                    loss, loss_cls, loss_risk, loss_fn, loss_s4_val = criterion(
+                        logits, risk_logits, y_b
+                    )
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    log.warning(f"NaN/Inf loss at epoch={epoch+1}, shard={shard_counter}, batch={batch_idx}, skipping")
+                    log.warning(
+                        f"NaN/Inf loss at E{epoch+1} S{shard_counter} B{batch_idx}, skipping"
+                    )
                     continue
 
                 scaler.scale(loss).backward()
@@ -603,50 +631,68 @@ def train_wrc_from_shards(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()     # ★ 每 batch 动态调整 lr
+                scheduler.step()
 
                 global_step += 1
                 train_loss += float(loss.item())
-                train_ce += float(loss_ce.item())
+                train_ce += float(loss_cls.item())
                 train_risk += float(loss_risk.item())
+                train_fn += float(loss_fn.item())
+                train_s4 += float(loss_s4_val.item())
                 n_batches += 1
 
-                if device.type == "cuda" and batch_idx % 50 == 0:
+                if device.type == "cuda" and batch_idx % 30 == 0:
                     alloc = torch.cuda.memory_allocated() / 1024**3
                     pbar.set_postfix({
                         "loss": f"{train_loss/max(n_batches,1):.4f}",
+                        "cls": f"{train_ce/max(n_batches,1):.3f}",
+                        "risk": f"{train_risk/max(n_batches,1):.3f}",
+                        "fn": f"{train_fn/max(n_batches,1):.3f}",
                         "gpu": f"{alloc:.1f}G",
                         "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                     })
 
             del ds, loader, shard_obj
 
-            # ★ 不要每个 shard 都强制 gc / empty_cache，隔 10 个再做一次
-            if shard_counter % 10 == 0:
+            if shard_counter % 15 == 0:
                 gc.collect()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
+            # 每 50 个 shard 打印一次小结
+            if shard_counter % 50 == 0:
+                log.info(
+                    f"  [E{epoch+1} S{shard_counter}/{len(epoch_shards)}] "
+                    f"loss={train_loss/max(n_batches,1):.4f} "
+                    f"(cls={train_ce/max(n_batches,1):.3f} "
+                    f"risk={train_risk/max(n_batches,1):.3f} "
+                    f"fn={train_fn/max(n_batches,1):.3f} "
+                    f"s4={train_s4/max(n_batches,1):.3f}) | "
+                    f"lr={optimizer.param_groups[0]['lr']:.1e} | "
+                    f"step={global_step}"
+                )
+
         pf.close()
 
         avg_loss = train_loss / max(n_batches, 1)
-        avg_ce   = train_ce / max(n_batches, 1)
+        avg_ce = train_ce / max(n_batches, 1)
         avg_risk = train_risk / max(n_batches, 1)
+        avg_fn = train_fn / max(n_batches, 1)
+        avg_s4 = train_s4 / max(n_batches, 1)
 
         val_m = evaluate_wrc_on_shards(
-            model,
-            val_shards,
-            device=device,
-            batch_size=batch_size * 2,
-            max_seq_len=max_seq_len,
+            model, val_shards, device=device,
+            batch_size=batch_size * 2, max_seq_len=max_seq_len,
             verbose=False,
         )
 
         cur_lr = optimizer.param_groups[0]["lr"]
 
         writer.add_scalar("Loss/train_total", avg_loss, epoch)
-        writer.add_scalar("Loss/train_ce", avg_ce, epoch)
+        writer.add_scalar("Loss/train_cls", avg_ce, epoch)
         writer.add_scalar("Loss/train_risk", avg_risk, epoch)
+        writer.add_scalar("Loss/train_fn", avg_fn, epoch)
+        writer.add_scalar("Loss/train_s4", avg_s4, epoch)
         writer.add_scalar("Loss/valid", val_m["loss"], epoch)
         writer.add_scalar("Metrics/accuracy", val_m["accuracy"], epoch)
         writer.add_scalar("Metrics/macro_f1", val_m["macro_f1"], epoch)
@@ -658,7 +704,8 @@ def train_wrc_from_shards(
 
         log.info(
             f"Epoch {epoch+1:>2}/{epochs} | "
-            f"loss={avg_loss:.4f} (ce={avg_ce:.4f}, risk={avg_risk:.4f}) | "
+            f"loss={avg_loss:.4f} "
+            f"(cls={avg_ce:.3f} risk={avg_risk:.3f} fn={avg_fn:.3f} s4={avg_s4:.3f}) | "
             f"val_loss={val_m['loss']:.4f} | "
             f"acc={val_m['accuracy']:.4f} | macro_f1={val_m['macro_f1']:.4f} | "
             f"DMR={val_m['dangerous_miss']:.4f} | s4={val_m['s4_underestimate']:.4f} | "
@@ -667,14 +714,12 @@ def train_wrc_from_shards(
         )
         log_gpu_memory(f"Epoch {epoch+1:>2} ")
 
-        # 保存 latest checkpoint
         save_training_checkpoint(
             model, optimizer, scheduler, scaler,
             epoch, best_dmr, best_macro_f1,
             latest_ckpt,
         )
 
-        # best checkpoint
         improved = (
             val_m["dangerous_miss"] < best_dmr
             or (abs(val_m["dangerous_miss"] - best_dmr) < 1e-8 and val_m["macro_f1"] > best_macro_f1)
@@ -689,14 +734,13 @@ def train_wrc_from_shards(
                 best_ckpt,
             )
             no_improve_epochs = 0
-            log.info(f"  ★ Best checkpoint updated: DMR={best_dmr:.4f}, macro_f1={best_macro_f1:.4f}")
+            log.info(f"  ★ Best: DMR={best_dmr:.4f} macro_f1={best_macro_f1:.4f}")
         else:
             no_improve_epochs += 1
             log.info(f"  No improvement for {no_improve_epochs} epoch(s)")
 
-        # early stopping
         if no_improve_epochs >= early_stop_patience:
-            log.info(f"Early stopping triggered (patience={early_stop_patience})")
+            log.info(f"Early stopping (patience={early_stop_patience})")
             break
 
         gc.collect()
@@ -710,8 +754,7 @@ def train_wrc_from_shards(
     log.info("\n=== Final Validation ===")
     evaluate_wrc_on_shards(
         model, val_shards, device=device,
-        batch_size=batch_size * 2,
-        max_seq_len=max_seq_len,
+        batch_size=batch_size * 2, max_seq_len=max_seq_len,
         verbose=True,
     )
 
@@ -720,24 +763,21 @@ def train_wrc_from_shards(
 
 
 # ================================================================
-# 7. 保存 / 加载（修复：存完整结构参数）
+# 9. 保存 / 加载
 # ================================================================
 
-def save_wrc_model(model: CustomWDRNet, tag: str = "wdr_v1") -> str:
-    """
-    保存模型结构参数 + 权重，确保 load_wrc_model 能完整重建。
-    """
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+def save_wrc_model(model: CustomWDRNet, tag: str = "wdr_safe") -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     name = f"stage1_wdr_{tag}_{ts}"
     path = os.path.join(MODEL_DIR, name + ".pt")
 
     torch.save({
         "model_state": model.state_dict(),
-        "dense_dim":   model.dense_dim,
-        "hidden_dim":  model.hidden_dim,
-        "num_layers":  model.num_layers,
+        "dense_dim": model.dense_dim,
+        "hidden_dim": model.hidden_dim,
+        "num_layers": model.num_layers,
         "feature_cols": STAGE1_FEATURE_COLS,
-        "st_indices":   ST_INDICES,
+        "st_indices": ST_INDICES,
     }, path)
 
     log.info(f"WDR model saved: {path}")
@@ -745,9 +785,6 @@ def save_wrc_model(model: CustomWDRNet, tag: str = "wdr_v1") -> str:
 
 
 def load_wrc_model(path: str, device: torch.device = None) -> CustomWDRNet:
-    """
-    完整重建 WDR 模型并加载权重。
-    """
     if device is None:
         device = DEVICE
 
@@ -761,12 +798,12 @@ def load_wrc_model(path: str, device: torch.device = None) -> CustomWDRNet:
     model.eval()
 
     log.info(f"WDR model loaded: {path}")
-    log.info(f"  dense_dim={data['dense_dim']} hidden={data['hidden_dim']} layers={data['num_layers']}")
+    log.info(f"  dense={data['dense_dim']} hidden={data['hidden_dim']} layers={data['num_layers']}")
     return model
 
 
 # ================================================================
-# 8. 推理接口（pipeline.py 调用入口）
+# 10. 推理接口（pipeline.py 调用入口）
 # ================================================================
 
 def predict_proba_wrc(
@@ -777,10 +814,11 @@ def predict_proba_wrc(
     device: torch.device = None,
 ) -> pd.DataFrame:
     """
-    批推理入口，由 pipeline.py 的 _process_day_stage2 按 batch 调用。
-
-    输入：  build_stage1_features_batch 返回的 link 级 DataFrame（含 order_id / day 列）
-    输出：  追加 pred_p1..p4 / pred_status / pred_entropy / pred_cong_prob / pred_omega
+    推理接口:
+      - 输出原始概率 pred_p1..p4
+      - 输出 risk 概率 pred_risk_prob
+      - pred_cong_prob = max(p_cong, risk_prob)
+      - pred_omega, pred_status, pred_entropy
     """
     if device is None:
         device = DEVICE
@@ -788,22 +826,21 @@ def predict_proba_wrc(
     model.eval()
     model.to(device)
 
-    # 加载标准化参数（训练时固定的）
     mean_dict, std_dict, feature_cols = load_stats()
     mean_s = pd.Series(mean_dict)
-    std_s  = pd.Series(std_dict)
+    std_s = pd.Series(std_dict)
 
     df = df.copy().reset_index(drop=True)
     df["_row_idx"] = np.arange(len(df))
 
-    # 标准化
     x = df[feature_cols].copy().replace([np.inf, -np.inf], np.nan).fillna(mean_s)
     scaled = ((x - mean_s) / std_s).astype("float32")
-    scaled = scaled.replace([np.inf, -np.inf], 0.0).fillna(0.0).values  # (N, D)
+    scaled = scaled.replace([np.inf, -np.inf], 0.0).fillna(0.0).values
 
     pred_proba = np.zeros((len(df), NUM_CLASSES), dtype=np.float32)
+    pred_risk = np.zeros(len(df), dtype=np.float32)
 
-    grouped    = df.groupby(["order_id", "day"], sort=False)
+    grouped = df.groupby(["order_id", "day"], sort=False)
     order_keys = list(grouped.groups.keys())
 
     for start in tqdm(
@@ -817,38 +854,38 @@ def predict_proba_wrc(
         seqs, row_indices_list, lengths = [], [], []
 
         for key in batch_keys:
-            grp  = grouped.get_group(key)
+            grp = grouped.get_group(key)
             idxs = grp["_row_idx"].values
             feats = scaled[idxs]
 
             if len(feats) > max_seq_len:
                 feats = feats[:max_seq_len]
-                idxs  = idxs[:max_seq_len]
+                idxs = idxs[:max_seq_len]
 
             feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
             seqs.append(torch.FloatTensor(feats))
             row_indices_list.append(idxs)
             lengths.append(len(feats))
 
-        # padding（按长度降序）
         sort_order = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True)
-        seqs             = [seqs[i]             for i in sort_order]
+        seqs = [seqs[i] for i in sort_order]
         row_indices_list = [row_indices_list[i] for i in sort_order]
-        lengths          = [lengths[i]          for i in sort_order]
+        lengths = [lengths[i] for i in sort_order]
 
         seqs_padded = pad_sequence(seqs, batch_first=True, padding_value=0.0).to(device)
-        lens_t      = torch.LongTensor(lengths).to(device)
-        st_t        = seqs_padded[:, :, ST_INDICES]
+        lens_t = torch.LongTensor(lengths).to(device)
+        st_t = seqs_padded[:, :, ST_INDICES]
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                logits, _ = model(seqs_padded, lens_t, st_t)
-                proba = F.softmax(logits, dim=-1).cpu().numpy()  # (B, T, 4)
+                logits, risk_logits = model(seqs_padded, lens_t, st_t)
+                probs = F.softmax(logits, dim=-1).cpu().numpy()
+                risk_prob = torch.sigmoid(risk_logits).squeeze(-1).cpu().numpy()
 
         for b, (L, idxs) in enumerate(zip(lengths, row_indices_list)):
-            pred_proba[idxs] = proba[b, :L]
+            pred_proba[idxs] = probs[b, :L]
+            pred_risk[idxs] = risk_prob[b, :L]
 
-    # 写回 DataFrame
     for k in range(NUM_CLASSES):
         df[f"pred_p{k+1}"] = pred_proba[:, k]
 
@@ -861,8 +898,10 @@ def predict_proba_wrc(
         pred_proba * np.log(pred_proba + eps)
     ).sum(axis=1).astype("float32")
 
-    df["pred_cong_prob"] = (pred_proba[:, 2] + pred_proba[:, 3]).astype("float32")
-    df["pred_omega"]     = (pred_proba[:, 2] * 1 + pred_proba[:, 3] * 3).astype("float32")
+    raw_cong = pred_proba[:, 2] + pred_proba[:, 3]
+    df["pred_risk_prob"] = pred_risk.astype("float32")
+    df["pred_cong_prob"] = np.maximum(raw_cong, pred_risk).astype("float32")
+    df["pred_omega"] = (pred_proba[:, 2] * 1 + pred_proba[:, 3] * 3).astype("float32")
 
     df.drop(columns=["_row_idx"], inplace=True)
     return df
