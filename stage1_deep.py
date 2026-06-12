@@ -492,10 +492,17 @@ def train_wrc_from_shards(
     log.info(f"Train shards: {len(train_shards)} | Val shards: {len(val_shards)}")
 
     # 估算 step 数
-    total_train_orders = sum(s["n_orders"] for s in train_shards)
-    steps_per_epoch = math.ceil(total_train_orders / batch_size)
+    # 精确计算每个 epoch 的真实 batch 数（按 shard 分别 ceil）
+    steps_per_epoch = sum(
+        math.ceil(s["n_orders"] / batch_size) for s in train_shards
+    )
     total_steps = epochs * steps_per_epoch
-    log.info(f"steps_per_epoch≈{steps_per_epoch} | total_steps≈{total_steps}")
+
+    log.info(
+        f"Exact steps_per_epoch={steps_per_epoch} | "
+        f"total_steps={total_steps} | "
+        f"train_shards={len(train_shards)} | batch_size={batch_size}"
+    )
 
     # 类别分布
     alpha_cls, risk_pos_weight = estimate_label_distribution_from_shards(
@@ -631,7 +638,14 @@ def train_wrc_from_shards(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+
+                # ★ 防止 OneCycleLR 超出 total_steps
+                if global_step < total_steps:
+                    scheduler.step()
+                else:
+                    log.warning(
+                        f"Scheduler step skipped: global_step={global_step}, total_steps={total_steps}"
+                    )
 
                 global_step += 1
                 train_loss += float(loss.item())
