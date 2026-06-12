@@ -1,9 +1,9 @@
 """
-stage1_dataset.py
-完整替换版：
-  - SingleShardSequenceDataset 加入 shard 级特征一致性自检
-  - ShardPrefetcher 不变
-  - create_dataloaders 不变（保持兼容）
+stage1_dataset.py — 动态筛选版
+改动:
+  1. manifest 只记录"所有可用 shard"
+  2. split_train_val_shards 根据 config.TRAIN_DAYS / TEST_DAYS 动态筛选
+  3. shard 目录改为 prepared_data/shards/
 """
 
 import os
@@ -19,11 +19,10 @@ from logger import get_logger
 
 log = get_logger()
 
-PREPARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prepared_data")
+PREPARED_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prepared_data")
 MANIFEST_PATH = os.path.join(PREPARED_DIR, "manifest.json")
-STATS_PATH = os.path.join(PREPARED_DIR, "stats.json")
+STATS_PATH    = os.path.join(PREPARED_DIR, "stats.json")
 
-# ★ 与 stage1_deep_lstmframe.py 和 prepare_stage1_dataset.py 三路完全一致
 PERIODIC_FEATURES = frozenset({
     "sin_slice", "cos_slice",
     "sin_arr_slice", "cos_arr_slice",
@@ -42,8 +41,7 @@ def load_manifest():
         )
     with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    log.info(f"Manifest loaded: {MANIFEST_PATH}")
-    log.info(f"  schema_version: {manifest.get('schema_version', 'unknown')}")
+    log.info(f"Manifest loaded: {len(manifest.get('shards', []))} total shard(s)")
     return manifest
 
 
@@ -55,8 +53,7 @@ def load_stats():
         )
     with open(STATS_PATH, "r", encoding="utf-8") as f:
         stats = json.load(f)
-    log.info(f"Stats loaded: {STATS_PATH}")
-    log.info(f"  feature_cols: {len(stats['feature_cols'])}")
+    log.info(f"Stats loaded: {len(stats['feature_cols'])} features")
     return stats["mean"], stats["std"], stats["feature_cols"]
 
 
@@ -66,70 +63,91 @@ def _safe_load_torch_file(path):
     try:
         return torch.load(path, map_location="cpu")
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to load shard: {path}\n"
-            f"Error: {repr(e)}\n"
-            f"Delete prepared_data and rerun prepare_stage1_dataset.py"
-        ) from e
+        raise RuntimeError(f"Failed to load shard: {path}\n{repr(e)}") from e
 
 
 # ============================================================
-# shard 划分
+# ★ 动态筛选 train / val / test
 # ============================================================
 
 def split_train_val_shards(val_ratio=0.15, seed=42):
+    """
+    根据 config.py 的 TRAIN_DAYS / TEST_DAYS 动态筛选 shard。
+    不再依赖 manifest 里写死的 train_shards / test_shards。
+    """
+    from config import TRAIN_DAYS, TEST_DAYS
+
     manifest = load_manifest()
-    train_shards = manifest.get("train_shards", [])
-    test_shards = manifest.get("test_shards", [])
+    all_shards = manifest.get("shards", [])
+
+    if not all_shards:
+        raise RuntimeError("No shards found in manifest.json")
+
+    train_days_set = set(TRAIN_DAYS)
+    test_days_set  = set(TEST_DAYS)
+
+    # 按天筛选
+    train_shards = [s for s in all_shards if s["day"] in train_days_set]
+    test_shards  = [s for s in all_shards if s["day"] in test_days_set]
+
+    # 检查是否有缺失
+    available_days = set(s["day"] for s in all_shards)
+    missing_train = train_days_set - available_days
+    missing_test  = test_days_set - available_days
+
+    if missing_train:
+        log.warning(
+            f"TRAIN_DAYS {sorted(missing_train)} not found in prepared shards. "
+            f"Run: python prepare_stage1_dataset.py"
+        )
+    if missing_test:
+        log.warning(
+            f"TEST_DAYS {sorted(missing_test)} not found in prepared shards. "
+            f"Run: python prepare_stage1_dataset.py"
+        )
 
     if not train_shards:
-        raise RuntimeError("No train_shards in manifest.json")
+        raise RuntimeError(
+            f"No train shards found for TRAIN_DAYS={TRAIN_DAYS}. "
+            f"Available days: {sorted(available_days)}"
+        )
 
-    idx = list(range(len(train_shards)))
+    # train 内部再拆 train / val（shard 级别）
+    shard_indices = list(range(len(train_shards)))
     random.seed(seed)
-    random.shuffle(idx)
+    random.shuffle(shard_indices)
 
     n_val = max(1, int(len(train_shards) * val_ratio))
-    val_set = set(idx[:n_val])
+    val_idx = set(shard_indices[:n_val])
 
-    train_split = [train_shards[i] for i in range(len(train_shards)) if i not in val_set]
-    val_split   = [train_shards[i] for i in range(len(train_shards)) if i in val_set]
+    train_split = [train_shards[i] for i in range(len(train_shards)) if i not in val_idx]
+    val_split   = [train_shards[i] for i in range(len(train_shards)) if i in val_idx]
 
-    log.info(f"Shard split: train={len(train_split)} val={len(val_split)} test={len(test_shards)}")
+    log.info(f"Dynamic shard split:")
+    log.info(f"  TRAIN_DAYS={sorted(train_days_set)} → {len(train_split)} train + {len(val_split)} val shard(s)")
+    log.info(f"  TEST_DAYS={sorted(test_days_set)} → {len(test_shards)} test shard(s)")
+    log.info(f"  Available days in manifest: {sorted(available_days)}")
+
     return train_split, val_split, test_shards
 
 
 # ============================================================
-# 单 shard Dataset（加入特征一致性自检）
+# Dataset / collate_fn / prefetcher（不变）
 # ============================================================
 
-def _check_periodic_feature_range(X_sample: np.ndarray, feature_cols: list,
-                                   shard_path: str, n_check: int = 500):
-    """
-    ★ 隐患 ① 防护：检查 shard 内周期特征是否被错误地 Z-Score 过。
-    如果周期特征被 Z-Score，其绝对值可能超过 2（正常 clip 后最大 1）。
-    发现异常时报 WARNING，而不是静默通过。
-    """
+def _check_periodic_feature_range(X_sample, feature_cols, shard_path, n_check=500):
     for j, col in enumerate(feature_cols):
         if col in PERIODIC_FEATURES:
-            col_vals = X_sample[:n_check, j] if X_sample.shape[0] >= n_check else X_sample[:, j]
-            max_abs = np.abs(col_vals).max()
-            if max_abs > 1.5:
+            vals = X_sample[:min(n_check, X_sample.shape[0]), j]
+            if np.abs(vals).max() > 1.5:
                 log.warning(
-                    f"⚠ Shard periodic feature anomaly detected!\n"
-                    f"  Shard: {os.path.basename(shard_path)}\n"
-                    f"  Feature: '{col}' | max_abs={max_abs:.4f} (expected ≤ 1.0)\n"
-                    f"  This shard was likely generated with Z-Score on periodic features.\n"
-                    f"  Please delete prepared_data/ and rerun: python prepare_stage1_dataset.py"
+                    f"⚠ Periodic feature anomaly in {os.path.basename(shard_path)}: "
+                    f"'{col}' max_abs={np.abs(vals).max():.4f}. Regenerate shards."
                 )
 
 
 class SingleShardSequenceDataset(Dataset):
-    """
-    加载单个 shard，含特征一致性自检。
-    """
-
-    def __init__(self, shard_obj: dict, max_seq_len: int = 100):
+    def __init__(self, shard_obj, max_seq_len=100):
         self.max_seq_len = max_seq_len
         self.X_list = shard_obj["X_list"]
         self.y_list = shard_obj["y_list"]
@@ -137,21 +155,15 @@ class SingleShardSequenceDataset(Dataset):
         self.day = shard_obj.get("day", "?")
         self.n_orders = shard_obj.get("n_orders", len(self.X_list))
 
-        # ★ 隐患 ① 防护：启动时抽检周期特征范围
         if len(self.X_list) > 0:
-            # 取第一条序列做检查
-            sample_x = self.X_list[0]
-            shard_path = shard_obj.get("path", "<unknown>")
-            # 从 stats 获取 feature_cols
             try:
-                _, _, feature_cols = load_stats()
+                _, _, fc = load_stats()
                 _check_periodic_feature_range(
-                    np.asarray(sample_x, dtype=np.float32),
-                    feature_cols,
-                    shard_path,
+                    np.asarray(self.X_list[0], dtype=np.float32),
+                    fc, shard_obj.get("path", "<unknown>"),
                 )
             except Exception:
-                pass  # 检查失败不影响训练主流程
+                pass
 
     def __len__(self):
         return len(self.X_list)
@@ -160,97 +172,47 @@ class SingleShardSequenceDataset(Dataset):
         x = np.asarray(self.X_list[idx][:self.max_seq_len], dtype=np.float32)
         y = np.asarray(self.y_list[idx][:self.max_seq_len], dtype=np.int64)
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        return (
-            torch.FloatTensor(x),
-            torch.LongTensor(y),
-            self.lengths[idx],
-        )
+        return torch.FloatTensor(x), torch.LongTensor(y), self.lengths[idx]
 
-
-# ============================================================
-# collate_fn
-# ============================================================
 
 def collate_fn(batch):
     seqs, labels, lengths = zip(*batch)
-
-    # 按长度降序（enforce_sorted=True 需要）
-    sorted_idx = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True)
-    seqs    = [seqs[i]    for i in sorted_idx]
-    labels  = [labels[i]  for i in sorted_idx]
-    lengths = [lengths[i] for i in sorted_idx]
-
-    seqs_padded   = pad_sequence(seqs,   batch_first=True, padding_value=0.0)
-    labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1)
-
-    return seqs_padded, labels_padded, torch.LongTensor(lengths)
+    so = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True)
+    seqs    = [seqs[i]    for i in so]
+    labels  = [labels[i]  for i in so]
+    lengths = [lengths[i] for i in so]
+    return (
+        pad_sequence(seqs, batch_first=True, padding_value=0.0),
+        pad_sequence(labels, batch_first=True, padding_value=-1),
+        torch.LongTensor(lengths),
+    )
 
 
-# ============================================================
-# shard 加载工具
-# ============================================================
-
-def load_single_shard(shard_info: dict) -> dict:
-    """加载一个 shard，并附上 path 供自检使用。"""
+def load_single_shard(shard_info):
     shard = _safe_load_torch_file(shard_info["path"])
-    shard["path"] = shard_info["path"]  # 注入 path 供 Dataset 自检
+    shard["path"] = shard_info["path"]
     return shard
 
 
-def create_single_shard_loader(
-    shard_info: dict,
-    batch_size: int = 128,
-    max_seq_len: int = 100,
-    shuffle: bool = True,
-    num_workers: int = 0,
-    pin_memory: bool = True,
-):
-    shard = load_single_shard(shard_info)
-    ds = SingleShardSequenceDataset(shard, max_seq_len=max_seq_len)
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-    )
-    return loader, ds
-
-
-# ============================================================
-# 后台预取
-# ============================================================
-
 class ShardPrefetcher:
-    """
-    后台线程预加载下一个 shard，消除 shard 切换停顿。
-    """
-
-    def __init__(self, shard_infos: list):
+    def __init__(self, shard_infos):
         self.shard_infos = shard_infos
         self.idx = 0
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.future = None
-
         if self.shard_infos:
             self.future = self.pool.submit(load_single_shard, self.shard_infos[0])
 
     def next(self):
         if self.future is None:
             return None, None
-
         shard_obj = self.future.result()
         shard_info = self.shard_infos[self.idx]
         self.idx += 1
-
         if self.idx < len(self.shard_infos):
             self.future = self.pool.submit(load_single_shard, self.shard_infos[self.idx])
         else:
             self.future = None
-
         return shard_info, shard_obj
 
     def close(self):

@@ -2,7 +2,7 @@
 config.py — 改进版
 """
 import os
-
+import re
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "output")
 DATA_DIR = os.path.join(BASE_DIR, "data_split")
 TOPO_PATH = os.path.join(BASE_DIR, "nextlinks", "nextlinks.txt")
@@ -14,7 +14,7 @@ SPLIT_SUBDIRS = {
 }
 
 MISSING_DAYS = {"03"}
-TRAIN_DAYS = [f"{d:02d}" for d in range(1, 7) if f"{d:02d}" not in MISSING_DAYS]
+TRAIN_DAYS = [f"{d:02d}" for d in range(1, 30) if f"{d:02d}" not in MISSING_DAYS]
 TEST_DAYS  = ["31"]
 
 # Stage 1
@@ -97,7 +97,7 @@ STAGE1_MODEL = "wrc"   # "lgbm" 或 "wrc"
 WRC_HIDDEN_DIM = 128
 WRC_NUM_LAYERS = 2
 WRC_BATCH_SIZE = 512
-WRC_EPOCHS = 5
+WRC_EPOCHS = 2
 WRC_LR = 8e-4
 WRC_MAX_SEQ_LEN = 200
 # DataLoader
@@ -108,16 +108,21 @@ num_workers = 2
 # ============================================================
 
 # loss 权重
-LOSS_LAMBDA_RISK = 0.50
-LOSS_LAMBDA_FN   = 0.80
-LOSS_LAMBDA_S4   = 0.60
+# LOSS_LAMBDA_RISK = 0.50
+# LOSS_LAMBDA_FN   = 0.80
+# LOSS_LAMBDA_S4   = 0.60
 FOCAL_GAMMA      = 2.0
-
+LOSS_LAMBDA_RISK = 0.20
+LOSS_LAMBDA_FN   = 0.30
+LOSS_LAMBDA_S4   = 0.10
 # 安全阈值（初始值，可后续网格搜索）
-SAFE_TAU_CONG       = 0.22   # P(s3)+P(s4) 超过此值，则按拥堵处理
-SAFE_TAU_RISK       = 0.35   # 风险头概率超过此值，则按拥堵处理
-SAFE_TAU_S4         = 0.12   # P(s4) 超过此值，则直接按 s4
-SAFE_TAU_RISK_HIGH  = 0.70   # 风险头极高，则直接按 s4
-
+# SAFE_TAU_CONG       = 0.22   # P(s3)+P(s4) 超过此值，则按拥堵处理
+# SAFE_TAU_RISK       = 0.35   # 风险头概率超过此值，则按拥堵处理
+# SAFE_TAU_S4         = 0.12   # P(s4) 超过此值，则直接按 s4
+# SAFE_TAU_RISK_HIGH  = 0.70   # 风险头极高，则直接按 s4
+SAFE_TAU_CONG      = 0.35
+SAFE_TAU_RISK      = 0.55
+SAFE_TAU_S4        = 0.45
+SAFE_TAU_RISK_HIGH = 0.90
 # 是否启用安全决策规则
 SAFE_DECISION = True

@@ -106,7 +106,7 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
             keep_extra_for_stage2=True,
         )
         if STAGE1_MODEL == "wrc":
-            from stage1_deep_lstmframe import predict_proba_wrc
+            from stage1_deep import predict_proba_wrc
             pred = predict_proba_wrc(model, feat)
         else:
             pred = predict_proba(model, feat)
@@ -223,7 +223,7 @@ def _run_stage1_train(topo):
     log.info("=" * 70)
 
     if STAGE1_MODEL == "wrc":
-        from stage1_deep_lstmframe import train_wrc_from_shards, save_wrc_model
+        from stage1_deep import train_wrc_from_shards, save_wrc_model
 
         model = train_wrc_from_shards(
             hidden_dim=WRC_HIDDEN_DIM,
@@ -346,8 +346,10 @@ def run_pipeline(mode: str = "train"):
     if mode == "train":
         s1_model, s1_model_path = _run_stage1_train(topo)
     else:
-        s1_model_path = _find_latest_model("stage1_lgbm", ".txt")
-        s1_model = load_stage1_model(s1_model_path)
+        from stage1_deep import load_wrc_model
+        # ★ 改成搜索 hier_ 前缀
+        s1_model_path = _find_latest_model("stage1_hier", ".pt")
+        s1_model = load_wrc_model(s1_model_path)
 
     # ---- 全局统计量 ----
     ct_threshold, cross_global_mean = _compute_global_cross_stats(TRAIN_DAYS)
