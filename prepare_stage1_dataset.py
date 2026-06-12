@@ -107,22 +107,38 @@ def fit_global_stats(topo, days, sample_orders_per_day=5000):
     return mean_dict, std_dict
 
 
+# prepare_stage1_dataset.py 中唯一需要替换的函数
+
+# 全局常量：周期特征集合（与 stage1_deep_lstmframe.py 保持完全一致）
+PERIODIC_FEATURES = frozenset({
+    "sin_slice", "cos_slice",
+    "sin_arr_slice", "cos_arr_slice",
+})
+
 def apply_stats(df, feature_cols, mean_dict, std_dict):
     """
-    对特征做标准化。
+    标准化规则（训练/验证/推理三路完全一致）:
+      - 周期特征 (sin/cos): 仅 clip 到 [-1, 1]，不做 Z-Score
+      - 其余特征: Z-Score 标准化
     """
     out = df.copy()
-
     mean_s = pd.Series(mean_dict)
     std_s = pd.Series(std_dict)
 
     x = out[feature_cols].copy()
     x = x.replace([np.inf, -np.inf], np.nan)
     x = x.fillna(mean_s)
-    x = (x - mean_s) / std_s
+
+    for col in feature_cols:
+        if col in PERIODIC_FEATURES:
+            # ★ 周期特征：只 clip，保留单位圆几何性质
+            x[col] = x[col].clip(-1.0, 1.0)
+        else:
+            denom = std_s[col] if std_s[col] > 1e-8 else 1.0
+            x[col] = (x[col] - mean_s[col]) / denom
+
     x = x.astype("float32")
     x = x.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
     out[feature_cols] = x
     return out
 

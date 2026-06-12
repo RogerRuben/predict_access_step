@@ -106,7 +106,7 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
             keep_extra_for_stage2=True,
         )
         if STAGE1_MODEL == "wrc":
-            from stage1_deep import predict_proba_wrc
+            from stage1_deep_lstmframe import predict_proba_wrc
             pred = predict_proba_wrc(model, feat)
         else:
             pred = predict_proba(model, feat)
@@ -223,7 +223,7 @@ def _run_stage1_train(topo):
     log.info("=" * 70)
 
     if STAGE1_MODEL == "wrc":
-        from stage1_deep import train_wrc_from_shards, save_wrc_model
+        from stage1_deep_lstmframe import train_wrc_from_shards, save_wrc_model
 
         model = train_wrc_from_shards(
             hidden_dim=WRC_HIDDEN_DIM,

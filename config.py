@@ -14,7 +14,7 @@ SPLIT_SUBDIRS = {
 }
 
 MISSING_DAYS = {"03"}
-TRAIN_DAYS = [f"{d:02d}" for d in range(1, 30) if f"{d:02d}" not in MISSING_DAYS]
+TRAIN_DAYS = [f"{d:02d}" for d in range(1, 7) if f"{d:02d}" not in MISSING_DAYS]
 TEST_DAYS  = ["31"]
 
 # Stage 1
