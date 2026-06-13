@@ -268,7 +268,7 @@ def run_pipeline(mode: str = "train"):
         if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier"):
             from stage1_deep import load_wrc_model
             # 按优先级搜索模型文件
-            for prefix in ["stage1_hier", "stage1_wdr"]:
+            for prefix in ["stage1_triple", "stage1_dualhead", "stage1_ordinal"]:
                 try:
                     s1_model_path = _find_latest_model(prefix, ".pt")
                     break
