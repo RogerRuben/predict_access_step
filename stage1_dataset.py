@@ -45,7 +45,11 @@ def load_manifest():
     return manifest
 
 
+# 在文件顶部加一个模块级标记
+_stats_loaded_logged = False
+
 def load_stats():
+    global _stats_loaded_logged
     if not os.path.exists(STATS_PATH):
         raise FileNotFoundError(
             f"stats.json not found: {STATS_PATH}\n"
@@ -53,7 +57,12 @@ def load_stats():
         )
     with open(STATS_PATH, "r", encoding="utf-8") as f:
         stats = json.load(f)
-    log.info(f"Stats loaded: {len(stats['feature_cols'])} features")
+
+    # ★ 只在第一次打印
+    if not _stats_loaded_logged:
+        log.info(f"Stats loaded: {len(stats['feature_cols'])} features")
+        _stats_loaded_logged = True
+
     return stats["mean"], stats["std"], stats["feature_cols"]
 
 

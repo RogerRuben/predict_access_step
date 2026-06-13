@@ -56,10 +56,15 @@ def build_supervision_signal(head_df: pd.DataFrame) -> pd.DataFrame:
 
 
 class DifficultyModel:
+
+
     INTERACTION_PAIRS = [
         ("D2_cong_severity", "U1_path_entropy"),
         ("D6_hard_cross", "U1_path_entropy"),
         ("D2_cong_severity", "D7_cross_freq"),
+        # ★ 新增
+        ("R1_max_p4", "U1_path_entropy"),
+        ("R1_max_p4", "D6_hard_cross"),
     ]
     SCHEMA_VERSION = "stage3_v3"
 

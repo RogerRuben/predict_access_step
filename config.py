@@ -14,8 +14,8 @@ SPLIT_SUBDIRS = {
 }
 
 MISSING_DAYS = {"03"}
-TRAIN_DAYS = [f"{d:02d}" for d in range(1, 30) if f"{d:02d}" not in MISSING_DAYS]
-TEST_DAYS  = ["31"]
+TRAIN_DAYS = [f"{d:02d}" for d in range(3, 10) if f"{d:02d}" not in MISSING_DAYS]
+TEST_DAYS  = ["30"]
 
 # Stage 1
 STATUS_CLASSES = [1, 2, 3, 4]
@@ -91,13 +91,13 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Stage 1 模型选择
-STAGE1_MODEL = "wrc"   # "lgbm" 或 "wrc"
 
+STAGE1_MODEL = "wdr"   # 或 "wrc"
 # WRC 超参数
 WRC_HIDDEN_DIM = 128
 WRC_NUM_LAYERS = 2
 WRC_BATCH_SIZE = 512
-WRC_EPOCHS = 2
+WRC_EPOCHS = 5
 WRC_LR = 8e-4
 WRC_MAX_SEQ_LEN = 200
 # DataLoader
