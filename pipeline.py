@@ -1,5 +1,10 @@
 """
-pipeline.py — 完整版（含 R1/R2 + 更新成本矩阵 + Stage 3 新特征）
+pipeline.py — 完整版
+集成功能：
+1. Stage 1 训练 / 加载
+2. ★ 新增 Stage 1 test evaluation（train/test 模式都可打印）
+3. Stage 2 缓存 + 订单级难度特征
+4. Stage 3 难度锚定与评估
 """
 
 import gc
@@ -8,21 +13,28 @@ import glob
 import hashlib
 import pandas as pd
 import numpy as np
+
 from config import (
-    TRAIN_DAYS, TEST_DAYS, CROSS_TIME_QUANTILE,
-    TRAIN_SAMPLE_RATE, BATCH_SIZE_ORDERS, MODEL_DIR, CACHE_DIR,
+    TRAIN_DAYS, TEST_DAYS,
+    CROSS_TIME_QUANTILE,
+    TRAIN_SAMPLE_RATE,
+    BATCH_SIZE_ORDERS,
+    MODEL_DIR, CACHE_DIR,
     STAGE1_MODEL,
     WRC_HIDDEN_DIM, WRC_NUM_LAYERS, WRC_BATCH_SIZE,
     WRC_EPOCHS, WRC_LR, WRC_MAX_SEQ_LEN,
 )
+
 from loader import load_day, load_split_files, load_topology
 from feature_eng import (
     build_stage1_features_batch,
     STAGE1_FEATURE_COLS, STAGE1_TARGET,
 )
 from stage2_assess import (
-    compute_deterministic, compute_uncertainty,
-    compute_safety_risk, compute_night,
+    compute_deterministic,
+    compute_uncertainty,
+    compute_safety_risk,
+    compute_night,
     STAGE2_ALL_COLS,
 )
 from stage3_anchor import build_supervision_signal, DifficultyModel
@@ -31,9 +43,9 @@ from logger import get_logger
 log = get_logger()
 
 
-# ================================================================
-# 工具
-# ================================================================
+# ============================================================
+# 工具函数
+# ============================================================
 
 def _find_latest_model(prefix: str, ext: str) -> str:
     pattern = os.path.join(MODEL_DIR, f"{prefix}*{ext}")
@@ -46,7 +58,11 @@ def _find_latest_model(prefix: str, ext: str) -> str:
 
 
 def _make_cache_key(day, s1_path, ct_thresh, cross_mean):
-    raw = f"{day}|{os.path.basename(s1_path)}|{ct_thresh:.4f}|{cross_mean:.4f}|v5_with_R1R2"
+    """
+    Stage 2 缓存 key。
+    注意：如果你改了 Stage1 的推理逻辑但没改模型路径，请手动清 cache。
+    """
+    raw = f"{day}|{os.path.basename(s1_path)}|{ct_thresh:.4f}|{cross_mean:.4f}|v7_stage1_eval"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -57,9 +73,9 @@ def _cache_paths(cache_key):
     )
 
 
-# ================================================================
-# Stage 2: 单天处理（含 R1/R2）
-# ================================================================
+# ============================================================
+# Stage 2: 单天处理（带缓存）
+# ============================================================
 
 def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
                         s1_model_path=""):
@@ -74,11 +90,12 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
 
     head, link, cross = load_day(day)
     unique_orders = link["order_id"].unique()
+
     s2_parts = []
     det_unc_cols = [c for c in STAGE2_ALL_COLS if c not in ("D11_night", "R1_max_p4", "R2_reject_ratio")]
 
     # 选择预测函数
-    if STAGE1_MODEL in ("wrc", "wdr"):
+    if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier", "ordinal", "dualhead", "triple"):
         from stage1_deep import predict_proba_wrc
         predict_fn = predict_proba_wrc
     else:
@@ -97,10 +114,8 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
         )
         pred = predict_fn(model, feat)
 
-        det = compute_deterministic(pred, cross_b, topo, ct_threshold, cross_global_mean)
-        unc = compute_uncertainty(pred)
-
-        # ★ 新增 R1/R2
+        det  = compute_deterministic(pred, cross_b, topo, ct_threshold, cross_global_mean)
+        unc  = compute_uncertainty(pred)
         risk = compute_safety_risk(pred)
 
         batch_s2 = det.merge(unc, on=["order_id", "day"], how="outer")
@@ -119,11 +134,10 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
     del s2_parts, link, cross
     gc.collect()
 
-    # D11 夜间
+    # D11
     night = compute_night(head)
     s2_all = s2_all.merge(night, on=["order_id", "day"], how="left")
 
-    # 最终 fillna
     for c in STAGE2_ALL_COLS:
         if c in s2_all.columns:
             s2_all[c] = s2_all[c].fillna(0)
@@ -133,7 +147,6 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
     del head, night
     gc.collect()
 
-    # 写缓存
     s2_all.to_pickle(s2_cache)
     head_slim.to_pickle(head_cache)
     log.info(f"  Day {day}: cached ({cache_key})")
@@ -141,34 +154,31 @@ def _process_day_stage2(day, topo, model, ct_threshold, cross_global_mean,
     return s2_all, head_slim
 
 
-# ================================================================
+# ============================================================
 # Stage 1: 训练
-# ================================================================
+# ============================================================
 
 def _run_stage1_train(topo):
     log.info("=" * 70)
     log.info(f"STAGE 1: Training (model={STAGE1_MODEL})")
     log.info("=" * 70)
 
-    if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier"):
-        # ★ 层级 WDR：从 prepared shard 训练
+    if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier", "ordinal", "dualhead", "triple"):
         from stage1_deep import train_wrc_from_shards, save_wrc_model
 
         model = train_wrc_from_shards(
-            hidden_dim  = WRC_HIDDEN_DIM,
-            num_layers  = WRC_NUM_LAYERS,
-            batch_size  = WRC_BATCH_SIZE,
-            epochs      = WRC_EPOCHS,
-            lr          = WRC_LR,
-            max_seq_len = WRC_MAX_SEQ_LEN,
+            hidden_dim=WRC_HIDDEN_DIM,
+            num_layers=WRC_NUM_LAYERS,
+            batch_size=WRC_BATCH_SIZE,
+            epochs=WRC_EPOCHS,
+            lr=WRC_LR,
+            max_seq_len=WRC_MAX_SEQ_LEN,
         )
         model_path = save_wrc_model(model, tag="v1")
         return model, model_path
 
     elif STAGE1_MODEL == "lgbm":
-        # LightGBM 分支
         from stage1_predict import train_model, save_stage1_model
-        import lightgbm as lgb
 
         X_parts, y_parts = [], []
         for day in TRAIN_DAYS:
@@ -184,7 +194,8 @@ def _run_stage1_train(topo):
                         link[link["order_id"].isin(batch_orders)],
                         head[head["order_id"].isin(batch_orders)],
                         cross[cross["order_id"].isin(batch_orders)],
-                        topo, keep_extra_for_stage2=False,
+                        topo,
+                        keep_extra_for_stage2=False,
                     )
                     valid = feat[feat[STAGE1_TARGET].isin([1, 2, 3, 4])]
                     if len(valid) > 0:
@@ -194,7 +205,8 @@ def _run_stage1_train(topo):
                     del feat, valid
                     gc.collect()
 
-                del head, link, cross; gc.collect()
+                del head, link, cross
+                gc.collect()
                 log.info(f"  Day {day}: {day_samples:,} samples")
             except FileNotFoundError:
                 log.warning(f"Day {day} missing, skipped.")
@@ -204,7 +216,8 @@ def _run_stage1_train(topo):
 
         X_all = np.concatenate(X_parts)
         y_all = np.concatenate(y_parts)
-        del X_parts, y_parts; gc.collect()
+        del X_parts, y_parts
+        gc.collect()
 
         if TRAIN_SAMPLE_RATE < 1.0:
             n = int(len(y_all) * TRAIN_SAMPLE_RATE)
@@ -213,19 +226,129 @@ def _run_stage1_train(topo):
 
         model = train_model(X_all, y_all)
         model_path = save_stage1_model(model, tag="v3")
-        del X_all, y_all; gc.collect()
+        del X_all, y_all
+        gc.collect()
         return model, model_path
 
     else:
         raise ValueError(
             f"Unknown STAGE1_MODEL='{STAGE1_MODEL}'. "
-            f"Supported: 'wdr', 'wrc', 'hier', 'hierarchical', 'lgbm'"
+            f"Supported: 'wdr', 'wrc', 'hier', 'hierarchical', "
+            f"'ordinal', 'dualhead', 'triple', 'lgbm'."
         )
 
 
-# ================================================================
+# ============================================================
+# ★ 新增：Stage 1 单独评估
+# ============================================================
+
+def _build_stage1_eval_criterion(stage1_module, train_shards, device):
+    """
+    根据当前 stage1_deep.py 里实际存在的类，动态构建评估 criterion。
+    避免 test 模式下没有 criterion。
+    """
+    # triple expert
+    if hasattr(stage1_module, "TripleExpertLoss") and hasattr(stage1_module, "estimate_weights"):
+        pw_q1, pw_q2, pw_q3, cls_alpha = stage1_module.estimate_weights(
+            train_shards, min(5, len(train_shards))
+        )
+        criterion = stage1_module.TripleExpertLoss(
+            pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
+            cls_alpha=cls_alpha,
+            gamma_q1=0.0, gamma_q2=2.0, gamma_q3=2.0,
+            gamma_cls=2.0, gamma_bnd=1.5,
+            lambda_cls=1.0, lambda_bnd=0.8, lambda_cons=0.0,
+        ).to(device)
+        return criterion
+
+    # dual-head
+    if hasattr(stage1_module, "HybridOrdinalClassificationLoss") and hasattr(stage1_module, "estimate_weights"):
+        pw_q1, pw_q2, pw_q3, cls_alpha = stage1_module.estimate_weights(
+            train_shards, min(5, len(train_shards))
+        )
+        criterion = stage1_module.HybridOrdinalClassificationLoss(
+            pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
+            cls_alpha=cls_alpha,
+            gamma_q1=0.0, gamma_q2=2.0, gamma_q3=2.0,
+            gamma_cls=2.0, lambda_cls=1.0, lambda_cons=0.05,
+        ).to(device)
+        return criterion
+
+    # ordinal
+    if hasattr(stage1_module, "FocalOrdinalLoss") and hasattr(stage1_module, "estimate_ordinal_pos_weights"):
+        pw_q1, pw_q2, pw_q3 = stage1_module.estimate_ordinal_pos_weights(
+            train_shards, min(5, len(train_shards))
+        )
+        criterion = stage1_module.FocalOrdinalLoss(
+            pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
+            gamma_q1=0.0, gamma_q2=2.0, gamma_q3=2.0,
+        ).to(device)
+        return criterion
+
+    raise RuntimeError("Cannot build Stage 1 evaluation criterion. "
+                       "Please expose the loss class and weight estimator in stage1_deep.py")
+
+
+def _run_stage1_test_evaluation(s1_model):
+    """
+    在 pipeline 中单独评估 Stage 1，打印 confusion matrix / recall / DMR。
+    """
+    if STAGE1_MODEL not in ("wrc", "wdr", "hierarchical", "hier", "ordinal", "dualhead", "triple"):
+        return
+
+    log.info("=" * 70)
+    log.info("STAGE 1: Test Evaluation")
+    log.info("=" * 70)
+
+    try:
+        import stage1_deep as stage1_module
+
+        train_shards, val_shards, test_shards = stage1_module.split_train_val_shards()
+
+        eval_shards = test_shards if len(test_shards) > 0 else val_shards
+        eval_name = "TEST" if len(test_shards) > 0 else "VAL(fallback)"
+
+        criterion = _build_stage1_eval_criterion(stage1_module, train_shards, stage1_module.DEVICE)
+
+        tau = float(s1_model.best_tau.item()) if hasattr(s1_model, "best_tau") else 0.55
+
+        log.info(f"Evaluating Stage 1 on {eval_name} shards: {len(eval_shards)} | tau={tau:.2f}")
+
+        stage1_eval = stage1_module.evaluate_on_shards(
+            s1_model,
+            eval_shards,
+            device=stage1_module.DEVICE,
+            criterion=criterion,
+            batch_size=WRC_BATCH_SIZE * 2,
+            max_seq_len=WRC_MAX_SEQ_LEN,
+            verbose=True,
+            tau=tau,
+        )
+
+        log.info(
+            f"[Stage1-{eval_name}] "
+            f"Integrated mF1={stage1_eval['macro_f1']:.4f} | "
+            f"DMR={stage1_eval['dangerous_miss']:.4f} | "
+            f"s4u={stage1_eval['s4_underestimate']:.4f}"
+        )
+        log.info(
+            f"[Stage1-{eval_name}] Integrated Recall: "
+            f"{[round(x, 4) for x in stage1_eval['recall_per_class']]}"
+        )
+        if "cls_recall" in stage1_eval:
+            log.info(
+                f"[Stage1-{eval_name}] Classifier Recall: "
+                f"{[round(x, 4) for x in stage1_eval['cls_recall']]}"
+            )
+        log.info(f"[Stage1-{eval_name}] Reject rate: {stage1_eval['reject_rate']:.4f}")
+
+    except Exception as e:
+        log.warning(f"Stage 1 evaluation skipped due to error: {repr(e)}")
+
+
+# ============================================================
 # 全局统计量
-# ================================================================
+# ============================================================
 
 def _compute_global_cross_stats(train_days):
     log.info("Computing global cross_time statistics (Train set only) ...")
@@ -247,50 +370,51 @@ def _compute_global_cross_stats(train_days):
         ct_threshold = 30.0
         cross_global_mean = 25.0
 
-    del ct_vals; gc.collect()
+    del ct_vals
+    gc.collect()
 
-    log.info(f"  cross_time P{int(CROSS_TIME_QUANTILE*100)} = {ct_threshold:.2f}s")
+    log.info(f"  cross_time P{int(CROSS_TIME_QUANTILE * 100)} = {ct_threshold:.2f}s")
     log.info(f"  cross_time global_mean = {cross_global_mean:.2f}s")
     return ct_threshold, cross_global_mean
 
 
-# ================================================================
-# 主管道
-# ================================================================
+# ============================================================
+# 主流程
+# ============================================================
 
 def run_pipeline(mode: str = "train"):
     topo = load_topology()
 
-    # Stage 1
+    # ---- Stage 1: train or load ----
     if mode == "train":
         s1_model, s1_model_path = _run_stage1_train(topo)
     else:
-        if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier"):
-            from stage1_deep import load_wrc_model
-            # 按优先级搜索模型文件
-            for prefix in ["stage1_triple", "stage1_dualhead", "stage1_ordinal"]:
+        if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier", "ordinal", "dualhead", "triple"):
+            import stage1_deep as stage1_module
+
+            # 优先级：triple > dualhead > ordinal > hier > wdr
+            for prefix in ["stage1_triple", "stage1_dualhead", "stage1_ordinal", "stage1_hier", "stage1_wdr"]:
                 try:
                     s1_model_path = _find_latest_model(prefix, ".pt")
                     break
                 except FileNotFoundError:
                     continue
             else:
-                raise FileNotFoundError(
-                    "No saved hierarchical/WDR model found. "
-                    "Please run: python main.py train"
-                )
-            s1_model = load_wrc_model(s1_model_path)
-        elif STAGE1_MODEL == "lgbm":
+                raise FileNotFoundError("No Stage 1 deep model found in saved_models/")
+
+            s1_model = stage1_module.load_wrc_model(s1_model_path)
+        else:
             from stage1_predict import load_stage1_model
             s1_model_path = _find_latest_model("stage1_lgbm", ".txt")
             s1_model = load_stage1_model(s1_model_path)
-        else:
-            raise ValueError(f"Unknown STAGE1_MODEL='{STAGE1_MODEL}'")
 
-    # 全局统计
+    # ---- ★ 新增：Stage 1 test evaluation ----
+    _run_stage1_test_evaluation(s1_model)
+
+    # ---- Stage 2/3 ----
     ct_threshold, cross_global_mean = _compute_global_cross_stats(TRAIN_DAYS)
 
-    # Stage 2: Train
+    # Stage 2 train
     train_final = None
     if mode == "train":
         log.info("=" * 70)
@@ -306,15 +430,17 @@ def run_pipeline(mode: str = "train"):
                 )
                 train_s2_list.append(s2)
                 train_head_list.append(head_slim)
-                del s2, head_slim; gc.collect()
+                del s2, head_slim
+                gc.collect()
             except FileNotFoundError:
                 log.warning(f"Day {day} missing, skipped.")
 
         train_s2 = pd.concat(train_s2_list, ignore_index=True)
         train_head_slim = pd.concat(train_head_list, ignore_index=True)
-        del train_s2_list, train_head_list; gc.collect()
+        del train_s2_list, train_head_list
+        gc.collect()
 
-    # Stage 2: Test
+    # Stage 2 test
     log.info("=" * 70)
     log.info("STAGE 2: Difficulty Assessment (Test)")
     log.info("=" * 70)
@@ -333,7 +459,8 @@ def run_pipeline(mode: str = "train"):
 
     test_s2 = pd.concat(test_s2_list, ignore_index=True)
     test_head_slim = pd.concat(test_head_list, ignore_index=True)
-    del test_s2_list, test_head_list; gc.collect()
+    del test_s2_list, test_head_list
+    gc.collect()
 
     # Stage 3
     log.info("=" * 70)
@@ -343,18 +470,20 @@ def run_pipeline(mode: str = "train"):
     if mode == "train":
         train_signal = build_supervision_signal(train_head_slim)
         train_final = train_s2.merge(train_signal, on=["order_id", "day"], how="inner")
-        del train_s2, train_head_slim; gc.collect()
+        del train_s2, train_head_slim
+        gc.collect()
 
         log.info(f"Train samples: {len(train_final):,}")
 
-        # ★ 打印 Stage 2 特征统计
         log.info("\nStage 2 feature statistics (train):")
         for col in STAGE2_ALL_COLS:
             if col in train_final.columns:
                 vals = train_final[col]
-                log.info(f"  {col:25s}  mean={vals.mean():.4f}  std={vals.std():.4f}  "
-                         f"min={vals.min():.4f}  max={vals.max():.4f}  "
-                         f"zeros={int((vals == 0).sum()):,}/{len(vals):,}")
+                log.info(
+                    f"  {col:25s}  mean={vals.mean():.4f}  std={vals.std():.4f}  "
+                    f"min={vals.min():.4f}  max={vals.max():.4f}  "
+                    f"zeros={int((vals == 0).sum()):,}/{len(vals):,}"
+                )
 
         diff_model = DifficultyModel()
         diff_model.fit(train_final, train_final["y_tilde"])
@@ -367,14 +496,15 @@ def run_pipeline(mode: str = "train"):
 
     test_signal = build_supervision_signal(test_head_slim)
     test_final = test_s2.merge(test_signal, on=["order_id", "day"], how="inner")
-    del test_s2, test_head_slim; gc.collect()
+    del test_s2, test_head_slim
+    gc.collect()
 
     log.info(f"Test samples: {len(test_final):,}")
 
     metrics = diff_model.evaluate(test_final, test_final["y_tilde"])
     test_final["difficulty"] = diff_model.predict(test_final)
 
-    # 分级
+    # ---- 分级输出 ----
     log.info("=" * 70)
     log.info("RESULTS")
     log.info("=" * 70)
