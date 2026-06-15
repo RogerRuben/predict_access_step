@@ -156,14 +156,30 @@ def _check_periodic_feature_range(X_sample, feature_cols, shard_path, n_check=50
 
 
 class SingleShardSequenceDataset(Dataset):
-    def __init__(self, shard_obj, max_seq_len=100):
+    """
+    加载单个 shard，含：
+    1. 周期特征范围检查
+    2. 数据驱动的 sequence-level sample_weights
+    """
+
+    def __init__(self, shard_obj: dict, max_seq_len: int = 100,
+                 class_counts: np.ndarray = None):
+        """
+        Parameters
+        ----------
+        shard_obj    : torch.load 出来的 shard dict
+        max_seq_len  : 截断长度
+        class_counts : 全局类别频率 np.array([n_s1, n_s2, n_s3, n_s4])
+                       用于数据驱动权重；若为 None，则用 shard 内频率估计
+        """
         self.max_seq_len = max_seq_len
-        self.X_list = shard_obj["X_list"]
-        self.y_list = shard_obj["y_list"]
+        self.X_list  = shard_obj["X_list"]
+        self.y_list  = shard_obj["y_list"]
         self.lengths = [min(int(v), max_seq_len) for v in shard_obj["lengths"]]
-        self.day = shard_obj.get("day", "?")
+        self.day     = shard_obj.get("day", "?")
         self.n_orders = shard_obj.get("n_orders", len(self.X_list))
 
+        # 周期特征检查
         if len(self.X_list) > 0:
             try:
                 _, _, fc = load_stats()
@@ -173,6 +189,64 @@ class SingleShardSequenceDataset(Dataset):
                 )
             except Exception:
                 pass
+
+        # ★ 数据驱动的 sequence-level sample_weights
+        self.sample_weights = self._compute_sample_weights(class_counts)
+
+    def _compute_sample_weights(self, global_counts=None):
+        """
+        计算每个序列的采样权重。
+
+        思路:
+          1. 统计当前 shard 内每个序列的最高风险类别
+          2. 用 inverse-frequency 方式赋权
+          3. 含 s2/s3 边界 (同时含 s2 和 s3) 的序列额外加权
+
+        Parameters
+        ----------
+        global_counts : np.array([n_s1,n_s2,n_s3,n_s4]) 来自 estimate_weights()
+                        如果为 None，则用当前 shard 内频率估计
+        """
+        if global_counts is None:
+            local_counts = np.zeros(4, dtype=np.int64)
+            for y in self.y_list:
+                arr = np.asarray(y)
+                arr = arr[(arr >= 0) & (arr < 4)]
+                if len(arr) > 0:
+                    local_counts += np.bincount(arr, minlength=4)
+            counts = np.maximum(local_counts, 1)
+        else:
+            counts = np.maximum(global_counts, 1)
+
+        total = counts.sum()
+
+        # inverse frequency，取 sqrt 平滑，避免极端权重
+        inv_freq = np.sqrt(total / (4 * counts.astype(float)))
+        inv_freq = inv_freq / inv_freq[0]           # 以 s1 为基准做归一化
+
+        weights = []
+        for y in self.y_list:
+            arr = np.asarray(y)
+            arr = arr[(arr >= 0) & (arr < 4)]
+
+            if len(arr) == 0:
+                weights.append(1.0)
+                continue
+
+            max_cls = int(arr.max())               # 序列最高风险类别
+            w = inv_freq[max_cls]
+
+            # ★ 额外奖励：同时含 s2 和 s3 的边界序列
+            # 这是 boundary head 最需要学的
+            unique_cls = set(arr.tolist())
+            if 1 in unique_cls and 2 in unique_cls:
+                w *= 1.5
+
+            # clip，避免过于极端的权重
+            w = float(np.clip(w, 1.0, 8.0))
+            weights.append(w)
+
+        return weights
 
     def __len__(self):
         return len(self.X_list)

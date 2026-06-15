@@ -244,14 +244,33 @@ def _run_stage1_train(topo):
 
 def _build_stage1_eval_criterion(stage1_module, train_shards, device):
     """
-    根据当前 stage1_deep.py 里实际存在的类，动态构建评估 criterion。
-    避免 test 模式下没有 criterion。
+    根据 stage1_deep.py 里实际存在的类，动态构建评估 criterion。
+    兼容当前所有版本。
     """
-    # triple expert
-    if hasattr(stage1_module, "TripleExpertLoss") and hasattr(stage1_module, "estimate_weights"):
-        pw_q1, pw_q2, pw_q3, cls_alpha = stage1_module.estimate_weights(
+    # 统一获取权重
+    if hasattr(stage1_module, "estimate_weights"):
+        result = stage1_module.estimate_weights(
             train_shards, min(5, len(train_shards))
         )
+        # estimate_weights 可能返回 4 或 5 个值
+        if len(result) == 5:
+            pw_q1, pw_q2, pw_q3, cls_alpha, _ = result
+        else:
+            pw_q1, pw_q2, pw_q3, cls_alpha = result
+    else:
+        pw_q1, pw_q2, pw_q3, cls_alpha = 1.0, 2.0, 4.0, np.ones(4, dtype=np.float32)
+
+    # 按优先级尝试不同的 loss 类
+    # OrdinalPrimaryLoss（当前最新版）
+    if hasattr(stage1_module, "OrdinalPrimaryLoss"):
+        criterion = stage1_module.OrdinalPrimaryLoss(
+            pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
+            cls_alpha=cls_alpha,
+        ).to(device)
+        return criterion
+
+    # TripleExpertLoss
+    if hasattr(stage1_module, "TripleExpertLoss"):
         criterion = stage1_module.TripleExpertLoss(
             pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
             cls_alpha=cls_alpha,
@@ -261,32 +280,33 @@ def _build_stage1_eval_criterion(stage1_module, train_shards, device):
         ).to(device)
         return criterion
 
-    # dual-head
-    if hasattr(stage1_module, "HybridOrdinalClassificationLoss") and hasattr(stage1_module, "estimate_weights"):
-        pw_q1, pw_q2, pw_q3, cls_alpha = stage1_module.estimate_weights(
-            train_shards, min(5, len(train_shards))
-        )
+    # HybridOrdinalClassificationLoss
+    if hasattr(stage1_module, "HybridOrdinalClassificationLoss"):
         criterion = stage1_module.HybridOrdinalClassificationLoss(
             pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
             cls_alpha=cls_alpha,
-            gamma_q1=0.0, gamma_q2=2.0, gamma_q3=2.0,
-            gamma_cls=2.0, lambda_cls=1.0, lambda_cons=0.05,
         ).to(device)
         return criterion
 
-    # ordinal
-    if hasattr(stage1_module, "FocalOrdinalLoss") and hasattr(stage1_module, "estimate_ordinal_pos_weights"):
-        pw_q1, pw_q2, pw_q3 = stage1_module.estimate_ordinal_pos_weights(
-            train_shards, min(5, len(train_shards))
-        )
+    # FocalOrdinalLoss
+    if hasattr(stage1_module, "FocalOrdinalLoss"):
         criterion = stage1_module.FocalOrdinalLoss(
             pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
-            gamma_q1=0.0, gamma_q2=2.0, gamma_q3=2.0,
         ).to(device)
         return criterion
 
-    raise RuntimeError("Cannot build Stage 1 evaluation criterion. "
-                       "Please expose the loss class and weight estimator in stage1_deep.py")
+    # CumulativeOrdinalLoss
+    if hasattr(stage1_module, "CumulativeOrdinalLoss"):
+        criterion = stage1_module.CumulativeOrdinalLoss(
+            pw_q1=pw_q1, pw_q2=pw_q2, pw_q3=pw_q3,
+        ).to(device)
+        return criterion
+
+    raise RuntimeError(
+        "Cannot build Stage 1 evaluation criterion. "
+        "No recognized loss class found in stage1_deep.py. "
+        f"Available: {[x for x in dir(stage1_module) if 'Loss' in x]}"
+    )
 
 
 def _run_stage1_test_evaluation(s1_model):
@@ -393,7 +413,7 @@ def run_pipeline(mode: str = "train"):
             import stage1_deep as stage1_module
 
             # 优先级：triple > dualhead > ordinal > hier > wdr
-            for prefix in ["stage1_triple", "stage1_dualhead", "stage1_ordinal", "stage1_hier", "stage1_wdr"]:
+            for prefix in ["stage1_ordpri", "stage1_triple", "stage1_dualhead", "stage1_ordinal"]:
                 try:
                     s1_model_path = _find_latest_model(prefix, ".pt")
                     break
