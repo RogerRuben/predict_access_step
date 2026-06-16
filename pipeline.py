@@ -347,7 +347,7 @@ def _run_stage1_test_evaluation(s1_model):
 
         log.info(
             f"[Stage1-{eval_name}] "
-            f"Integrated mF1={stage1_eval['macro_f1']:.4f} | "
+            f"Integrated mF1={stage1_eval.get('macro_f1', stage1_eval.get('ord_macro_f1', 0)):.4f}"
             f"DMR={stage1_eval['dangerous_miss']:.4f} | "
             f"s4u={stage1_eval['s4_underestimate']:.4f}"
         )
