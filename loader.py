@@ -31,9 +31,34 @@ def _read_single_file(filepath: str) -> pd.DataFrame:
 
 
 def _glob_day_files(file_type: str, day_id: str) -> list[str]:
+    """
+    兼容两种命名：
+      1) head_01_1
+      2) head01_1.csv
+    """
     subdir = SPLIT_SUBDIRS[file_type]
     folder = os.path.join(DATA_DIR, subdir)
-    return sorted(glob.glob(os.path.join(folder, f"{file_type}{day_id}_*")))
+
+    patterns = [
+        os.path.join(folder, f"{file_type}_{day_id}_*"),
+        os.path.join(folder, f"{file_type}{day_id}_*"),
+        os.path.join(folder, f"{file_type}_{int(day_id)}_*"),
+        os.path.join(folder, f"{file_type}{int(day_id)}_*"),
+    ]
+
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(p))
+
+    files = sorted(set(files))
+
+    if not files:
+        raise FileNotFoundError(
+            f"No files found for {file_type} day={day_id}\n"
+            f"  Tried patterns:\n    " + "\n    ".join(patterns)
+        )
+
+    return files
 
 
 def load_split_files(file_type: str, day_id: str) -> pd.DataFrame:
