@@ -27,6 +27,7 @@ stage2_assess.py — 完整版（含 R1/R2 安全风险指标）
 
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from config import (
     CONGESTION_PROB_THRESHOLD,
     ENTROPY_HIGH_THRESHOLD,
@@ -39,6 +40,64 @@ from logger import get_logger
 
 log = get_logger()
 
+
+
+
+# ============================================================
+# 天气严重程度有序映射（值越大越恶劣）
+# ============================================================
+WEATHER_SEVERITY_MAP = {
+    'cloudy': 0,
+    'showers': 1,
+    'moderate rain': 2,
+    'heavy rain': 3,
+    'rainstorm': 4,
+}
+EXTREME_WEATHER_SET = {'heavy rain', 'rainstorm'}
+
+# ============================================================
+# Stage 2 全部输出列（含新增特征）
+# ============================================================
+# ============================================================
+# Stage 2 完整列清单（所有可能输出的列）
+# ============================================================
+STAGE2_ALL_COLS = [
+    # 确定性指标
+    'D1_cong_exposure', 'D2_cong_severity', 'D3_cong_persist',
+    'D4_status_jump', 'D5_coupling', 'D6_hard_cross',
+    'D7_cross_freq', 'D8_cross_share', 'D9_topo_complex',
+    'D10_topo_cluster', 'D11_night',
+    # 不确定性指标
+    'U1_path_entropy', 'U2_high_unc_ratio', 'U3_unc_persist',
+    # 安全风险指标（旧 + 新）
+    "R1_max_p4",
+    "R1_p4_p95",
+    "R1_p4_top10_mean",
+    "R1_p4_exposure",
+    "R1_cong_exposure",
+    "R1_p4_tail_mass_030",
+    "R1_p4_tail_mass_020",
+    "R1_p4_std",
+    "R2_reject_ratio",
+    # Markov 链特征
+    'D12_transition_entropy', 'D13_risk_exposure',
+    'D14_first_hitting_time', 'D15_stationary_risk',
+    # 天气特征
+    'weather_severity', 'temp_avg', 'temp_range',
+    'is_extreme_weather', 'is_high_temp', 'is_low_temp',
+
+]
+
+log = get_logger()
+
+
+def _top_frac_mean(x, frac=0.10):
+    arr = np.asarray(x, dtype="float32")
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return 0.0
+    k = max(1, int(np.ceil(len(arr) * frac)))
+    return float(np.sort(arr)[-k:].mean())
 
 # ================================================================
 # 确定性场景难度 D1-D11
@@ -129,9 +188,13 @@ def compute_deterministic(link_df, cross_df, topo, cross_time_threshold,
                 mx = max(mx, cur); cur = 0.0
         return max(mx, cur)
 
+    d3_slim = df[["order_id", "day", "_cong_flag", "_cong_wt"]].copy()
+
     d3 = (
-        df.groupby(["order_id", "day"], sort=False)
-        .apply(_max_cong_run).rename("D3_cong_persist").reset_index()
+        d3_slim.groupby(["order_id", "day"], sort=False)
+        .apply(_max_cong_run)
+        .rename("D3_cong_persist")
+        .reset_index()
     )
     result = result.merge(d3, on=["order_id", "day"], how="left")
 
@@ -144,9 +207,13 @@ def compute_deterministic(link_df, cross_df, topo, cross_time_threshold,
         cs = np.concatenate([[0], np.cumsum(flags)])
         return int((cs[w:] - cs[:-w]).max())
 
+    d10_slim = df[["order_id", "day", "is_high_deg"]].copy()
+
     d10 = (
-        df.groupby(["order_id", "day"], sort=False)
-        .apply(_max_deg_window).rename("D10_topo_cluster").reset_index()
+        d10_slim.groupby(["order_id", "day"], sort=False)
+        .apply(_max_deg_window)
+        .rename("D10_topo_cluster")
+        .reset_index()
     )
     result = result.merge(d10, on=["order_id", "day"], how="left")
 
@@ -161,41 +228,64 @@ def compute_deterministic(link_df, cross_df, topo, cross_time_threshold,
 # ================================================================
 
 def compute_uncertainty(link_df):
-    df = link_df.copy()
-    df["wt"]         = (df["link_time"] * df["link_ratio"]).astype("float32")
+    """
+    计算不确定性指标 U1/U2/U3。
+
+    只取必要列，避免 pandas 在宽表上 groupby.apply 时复制 30+ 列。
+    """
+    # 只取必要列
+    df = link_df[
+        ["order_id", "day", "link_time", "link_ratio", "pred_entropy"]
+    ].copy()
+
+    df["wt"] = (df["link_time"] * df["link_ratio"]).astype("float32")
     df["entropy_wt"] = (df["pred_entropy"] * df["wt"]).astype("float32")
-    df["is_high_unc"] = df["pred_entropy"] > ENTROPY_HIGH_THRESHOLD
-    df["high_unc_wt"] = (df["wt"] * df["is_high_unc"].astype("float32")).astype("float32")
+    df["_unc_flag"] = (df["pred_entropy"] > ENTROPY_HIGH_THRESHOLD).astype("bool")
+    df["high_unc_wt"] = (df["wt"] * df["_unc_flag"].astype("float32")).astype("float32")
 
     agg = df.groupby(["order_id", "day"], sort=False).agg(
         wt_sum=("wt", "sum"),
         entropy_wt_sum=("entropy_wt", "sum"),
         high_unc_wt_sum=("high_unc_wt", "sum"),
     )
-    agg["U1_path_entropy"]    = np.where(agg["wt_sum"] > 0, agg["entropy_wt_sum"] / agg["wt_sum"], 0)
-    agg["U2_high_unc_ratio"]  = np.where(agg["wt_sum"] > 0, agg["high_unc_wt_sum"] / agg["wt_sum"], 0)
+
+    agg["U1_path_entropy"] = np.where(
+        agg["wt_sum"] > 0,
+        agg["entropy_wt_sum"] / agg["wt_sum"],
+        0.0,
+    )
+    agg["U2_high_unc_ratio"] = np.where(
+        agg["wt_sum"] > 0,
+        agg["high_unc_wt_sum"] / agg["wt_sum"],
+        0.0,
+    )
+
     result = agg[["U1_path_entropy", "U2_high_unc_ratio"]].reset_index()
 
-    # U3: 连续高不确定性段
-    df["_unc_flag"] = df["is_high_unc"].astype("int8")
+    # U3: 连续高不确定性段（窄表 apply）
+    slim = df[["order_id", "day", "_unc_flag", "wt"]].copy()
 
     def _max_unc_run(grp):
         flags = grp["_unc_flag"].values
-        wts   = grp["wt"].values
+        wts = grp["wt"].values
         mx = cur = 0.0
         for i in range(len(flags)):
             if flags[i]:
                 cur += wts[i]
             else:
-                mx = max(mx, cur); cur = 0.0
+                mx = max(mx, cur)
+                cur = 0.0
         return max(mx, cur)
 
     u3 = (
-        df.groupby(["order_id", "day"], sort=False)
-        .apply(_max_unc_run).rename("U3_unc_persist").reset_index()
+        slim.groupby(["order_id", "day"], sort=False)
+        .apply(_max_unc_run)
+        .rename("U3_unc_persist")
+        .reset_index()
     )
+
     result = result.merge(u3, on=["order_id", "day"], how="left")
-    result["U3_unc_persist"] = result["U3_unc_persist"].fillna(0)
+    result["U3_unc_persist"] = result["U3_unc_persist"].fillna(0).astype("float32")
 
     return result
 
@@ -204,55 +294,60 @@ def compute_uncertainty(link_df):
 # ★ 新增安全风险 R1-R2
 # ================================================================
 
-def compute_safety_risk(link_df):
+def compute_safety_risk(link_df: pd.DataFrame) -> pd.DataFrame:
     """
-    R1: 路径上最大极端拥堵概率 max(pred_risk_prob)
-        ← 直接捕捉"路径上最危险的一个点"
-        ← pred_risk_prob = P(s4) = p_cong * p_severe
+    计算安全风险指标（分布型版本）
 
-    R2: 路径上 reject 标记的 link 时间占比
-        ← 捕捉"模型对这条路径有多不确定"
-        ← pred_reject = 信息熵超过阈值的 link
+    新增指标：
+        R1_p4_p95: p4 的 95% 分位数
+        R1_p4_top10_mean: p4 最高的 10% 的均值
+        R1_p4_exposure: 时间加权 p4 暴露
+        R1_cong_exposure: 时间加权拥堵暴露
+        R1_p4_tail_mass_030: p4 > 0.30 的比例
+        R1_p4_tail_mass_020: p4 > 0.20 的比例
+        R1_p4_std: p4 的标准差
     """
     df = link_df.copy()
-    df["wt"] = (df["link_time"] * df["link_ratio"]).astype("float32")
 
-    # R1: max P(s4) along path
-    if "pred_risk_prob" in df.columns:
-        r1 = (
-            df.groupby(["order_id", "day"], sort=False)["pred_risk_prob"]
-            .max().rename("R1_max_p4").reset_index()
-        )
-    else:
-        # 兼容旧模型：用 pred_p4 替代
-        if "pred_p4" in df.columns:
-            r1 = (
-                df.groupby(["order_id", "day"], sort=False)["pred_p4"]
-                .max().rename("R1_max_p4").reset_index()
-            )
+    if "pred_p4" not in df.columns:
+        raise ValueError("compute_safety_risk requires pred_p4.")
+
+    df["pred_p4"] = df["pred_p4"].fillna(0).clip(0.0, 1.0)
+
+    if "pred_cong_prob" not in df.columns:
+        if "pred_p3" in df.columns:
+            df["pred_cong_prob"] = df["pred_p3"] + df["pred_p4"]
         else:
-            r1 = (
-                df[["order_id", "day"]].drop_duplicates()
-                .assign(R1_max_p4=0.0)
-            )
+            df["pred_cong_prob"] = df["pred_p4"]
+    df["pred_cong_prob"] = df["pred_cong_prob"].fillna(0).clip(0.0, 1.0)
 
-    # R2: reject ratio (时间加权)
-    if "pred_reject" in df.columns:
-        df["reject_wt"] = df["wt"] * df["pred_reject"].astype("float32")
-        r2_num = df.groupby(["order_id", "day"], sort=False)["reject_wt"].sum()
-        wt_sum = df.groupby(["order_id", "day"], sort=False)["wt"].sum()
-        r2_ratio = (r2_num / wt_sum.clip(lower=1e-6)).rename("R2_reject_ratio").reset_index()
-    else:
-        r2_ratio = (
-            df[["order_id", "day"]].drop_duplicates()
-            .assign(R2_reject_ratio=0.0)
-        )
+    wt = df.get("link_time", pd.Series(1.0, index=df.index)).fillna(1.0).clip(lower=1.0)
+    if "downstream_cross_time" in df.columns:
+        wt = wt + df["downstream_cross_time"].fillna(0).clip(lower=0.0)
+    df["_risk_wt"] = wt.astype("float32")
 
-    result = r1.merge(r2_ratio, on=["order_id", "day"], how="outer")
-    result["R1_max_p4"]       = result["R1_max_p4"].fillna(0)
-    result["R2_reject_ratio"] = result["R2_reject_ratio"].fillna(0)
+    rows = []
+    for (oid, day), g in df.groupby(["order_id", "day"], sort=False):
+        p4 = g["pred_p4"].values.astype("float32")
+        cong = g["pred_cong_prob"].values.astype("float32")
+        w = g["_risk_wt"].values.astype("float32")
+        wsum = float(np.maximum(w.sum(), 1e-6))
 
-    return result
+        rows.append({
+            "order_id": oid,
+            "day": day,
+            "R1_max_p4": float(np.nanmax(p4)) if len(p4) else 0.0,
+            "R1_p4_p95": float(np.nanpercentile(p4, 95)) if len(p4) else 0.0,
+            "R1_p4_top10_mean": _top_frac_mean(p4, 0.10),
+            "R1_p4_exposure": float(np.nansum(p4 * w) / wsum),
+            "R1_cong_exposure": float(np.nansum(cong * w) / wsum),
+            "R1_p4_tail_mass_030": float(np.nanmean(p4 > 0.30)) if len(p4) else 0.0,
+            "R1_p4_tail_mass_020": float(np.nanmean(p4 > 0.20)) if len(p4) else 0.0,
+            "R1_p4_std": float(np.nanstd(p4)) if len(p4) else 0.0,
+            "R2_reject_ratio": float(g.get("pred_reject", pd.Series(False, index=g.index)).mean()),
+        })
+
+    return pd.DataFrame(rows)
 
 
 # ================================================================
@@ -269,6 +364,126 @@ def compute_night(head_df):
     return df[["order_id", "day", "D11_night"]]
 
 
+def compute_markov_features(link_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    基于 Markov 链理论计算路径风险特征。
+
+    学术依据：
+        将路径路况序列视为有限状态离散时间 Markov 链，
+        状态空间 S = {1, 2, 3, 4} (s1~s4)。
+
+    输出特征：
+        D12_transition_entropy: 状态转移熵，反映路况波动程度
+        D13_risk_exposure: 风险暴露积分 Σ r(s_t)·Δt_t
+        D14_first_hitting_time: 首次进入拥堵状态 (≥3) 的时间
+        D15_stationary_risk: 平稳分布下的拥堵概率
+    """
+    df = link_df.copy()
+
+    # 定义风险函数 r(s): 状态越拥堵，风险越高
+    def risk_function(s):
+        # s 为 1~4，映射到 [0, 1]
+        return (s - 1) / 3.0
+
+    df['risk_weight'] = df['pred_status'].apply(risk_function).astype('float32')
+    df['wt'] = (df['link_time'] + df['link_ratio']).astype('float32')
+
+    # ---- D13: 风险暴露积分 ----
+    # 在每个 link 上，风险 = risk_weight * wt
+    df['risk_exposure'] = (df['risk_weight'] * df['wt']).astype('float32')
+    risk_exposure = df.groupby(['order_id', 'day'])['risk_exposure'].sum().rename('D13_risk_exposure').reset_index()
+
+    # ---- D14: 首次恶化时间 ----
+    # 定义"恶化"为状态 >= 3 (拥堵)
+    def first_hitting_time(grp):
+        statuses = grp['pred_status'].values
+        cum_times = grp['cum_travel_time'].values
+        for i, s in enumerate(statuses):
+            if s >= 3:
+                return cum_times[i]
+        return cum_times[-1] if len(cum_times) > 0 else 0.0
+
+    first_hit = df.groupby(['order_id', 'day']).apply(first_hitting_time).rename('D14_first_hitting_time').reset_index()
+
+    # ---- D12: 状态转移熵 ----
+    # 计算每个订单内状态转移矩阵的熵
+    def transition_entropy(grp):
+        statuses = grp['pred_status'].values
+        if len(statuses) < 2:
+            return 0.0
+        # 统计转移频次
+        trans_count = defaultdict(int)
+        for i in range(len(statuses) - 1):
+            trans_count[(statuses[i], statuses[i + 1])] += 1
+        total = sum(trans_count.values())
+        # 计算熵
+        entropy = 0.0
+        for count in trans_count.values():
+            p = count / total
+            entropy -= p * np.log(p + 1e-10)
+        return entropy
+
+    trans_entropy = df.groupby(['order_id', 'day']).apply(transition_entropy).rename(
+        'D12_transition_entropy').reset_index()
+
+    # ---- D15: 平稳分布风险 ----
+    # 估计该路径的平稳分布，计算拥堵状态 (≥3) 的概率
+    def stationary_risk(grp):
+        statuses = grp['pred_status'].values
+        if len(statuses) == 0:
+            return 0.0
+        # 用经验分布近似平稳分布
+        counts = np.bincount(statuses.astype(int), minlength=5)[1:5]  # 1~4
+        if counts.sum() == 0:
+            return 0.0
+        stationary = counts / counts.sum()
+        # 拥堵概率 = P(s3) + P(s4)
+        return stationary[2] + stationary[3]
+
+    stat_risk = df.groupby(['order_id', 'day']).apply(stationary_risk).rename('D15_stationary_risk').reset_index()
+
+    # ---- 合并 ----
+    result = risk_exposure.merge(first_hit, on=['order_id', 'day'], how='outer')
+    result = result.merge(trans_entropy, on=['order_id', 'day'], how='outer')
+    result = result.merge(stat_risk, on=['order_id', 'day'], how='outer')
+
+    # 填充缺失值
+    for col in ['D13_risk_exposure', 'D14_first_hitting_time', 'D12_transition_entropy', 'D15_stationary_risk']:
+        result[col] = result[col].fillna(0)
+
+    return result
+
+
+# ============================================================
+# ★ 新增：天气特征
+# ============================================================
+
+def compute_weather_features(head_batch: pd.DataFrame) -> pd.DataFrame:
+    """
+    从 head 数据中提取天气特征（有序编码）。
+
+    学术依据：
+        天气严重程度是有序类别（Ordinal），而非无序类别（Nominal）。
+        使用有序编码保留"暴雨 > 大雨 > 中雨 > 阵雨 > 多云"的单调约束。
+    """
+    df = head_batch[['order_id', 'day', 'weather', 'hightemp', 'lowtemp']].copy()
+
+    # 1. 天气严重程度有序编码
+    df['weather_severity'] = df['weather'].map(WEATHER_SEVERITY_MAP).fillna(0).astype(np.float32)
+
+    # 2. 极端天气标志（用于 Known-Group 校准，不直接进模型）
+    df['is_extreme_weather'] = df['weather'].isin(EXTREME_WEATHER_SET).astype(np.float32)
+
+    # 3. 温度特征
+    df['temp_avg'] = ((df['hightemp'] + df['lowtemp']) / 2).astype(np.float32)
+    df['temp_range'] = (df['hightemp'] - df['lowtemp']).astype(np.float32)
+
+    # 4. 极端温度标志
+    df['is_high_temp'] = (df['hightemp'] > 35).astype(np.float32)
+    df['is_low_temp'] = (df['lowtemp'] < 0).astype(np.float32)
+
+    return df[['order_id', 'day', 'weather_severity', 'is_extreme_weather',
+               'temp_avg', 'temp_range', 'is_high_temp', 'is_low_temp']]
 # ================================================================
 # 特征列定义（Stage 3 使用）
 # ================================================================
@@ -287,5 +502,10 @@ STAGE2_UNC_COLS = [
 STAGE2_RISK_COLS = [
     "R1_max_p4", "R2_reject_ratio",
 ]
+STAGE2_WEATHER_COLS = [
+    # ★ 新增天气特征
+    'weather_severity', 'temp_avg', 'temp_range',
+    'is_extreme_weather', 'is_high_temp', 'is_low_temp',
+]
 
-STAGE2_ALL_COLS = STAGE2_DET_COLS + STAGE2_UNC_COLS + STAGE2_RISK_COLS
+# STAGE2_ALL_COLS = STAGE2_DET_COLS + STAGE2_UNC_COLS + STAGE2_RISK_COLS + STAGE2_WEATHER_COLS

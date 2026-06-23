@@ -13,15 +13,25 @@ SPLIT_SUBDIRS = {
     "cross": "cross_split",
 }
 
-MISSING_DAYS = {"03"}
-TRAIN_DAYS = [f"{d:02d}" for d in range(1, 15) if f"{d:02d}" not in MISSING_DAYS]
-TEST_DAYS  = ["30"]
+# MISSING_DAYS = {"03","08","09","10"}
+# TRAIN_DAYS = [f"{d:02d}" for d in range(1, 11) if f"{d:02d}" not in MISSING_DAYS]
+# TEST_DAYS  = ["13"]
+# MISSING_DAYS = {"03","08","09","10"}
+# TRAIN_DAYS = [f"{d:02d}" for d in range(15, 16) if f"{d:02d}" not in MISSING_DAYS]
+# TEST_DAYS  = ["31"]
+
+# 日期配置 —— 保守版本，排除 Day 07（内存问题）和 Day 08/09/10（缺失）
+TRAIN_DAYS = ["01", "02", "04", "05", "06", "11"]
+TEST_DAYS = ["13"]
+
+# 如果后续确认 Day 07 问题修复，可加回
+# 如果确认 Day 31 数据存在，可切换测试日
 
 # Stage 1
 STATUS_CLASSES = [1, 2, 3, 4]
 NUM_CLASSES = len(STATUS_CLASSES)
 TRAIN_SAMPLE_RATE = 0.7
-BATCH_SIZE_ORDERS = 3000
+BATCH_SIZE_ORDERS = 1500
 
 LGBM_PARAMS = {
     "objective": "multiclass",
@@ -60,7 +70,13 @@ STAGE3_USE_FLOAT64 = False  # False=float32, 节省内存；True=float64, 数值
 # 模型保存
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
+# 校验保存
+FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_figs")
+os.makedirs(FIGURES_DIR, exist_ok=True)
 
+# 校验保存
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_result")
+os.makedirs(RESULTS_DIR, exist_ok=True)
 # 日志
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -126,3 +142,45 @@ SAFE_TAU_S4        = 0.45
 SAFE_TAU_RISK_HIGH = 0.90
 # 是否启用安全决策规则
 SAFE_DECISION = True
+# ============================================================
+# K折交叉验证配置（Stage 1）
+# ============================================================
+USE_KFOLD = False          # 是否启用 K折交叉验证（默认关闭，仅在最终调优时开启）
+KFOLD_SPLITS = 5           # 折数
+KFOLD_SEED = 42            # 随机种子
+
+# ============================================================
+# Stage 1: Tau 搜索开关
+# ============================================================
+SKIP_TAU_SEARCH = False          # True: 跳过搜索，使用默认值；False: 执行搜索
+DEFAULT_TAU = 0.55              # 默认 tau 值
+DEFAULT_TEMPERATURE = 1.0       # 默认温度值
+
+# 运行模式
+RUN_PROFILE = "smoke"   # smoke / debug / full
+
+if RUN_PROFILE == "smoke":
+    WRC_EPOCHS = 2
+    MAX_TRAIN_SHARDS = 12
+    MAX_VAL_SHARDS = 4
+    MAX_EVAL_BATCHES = 200
+elif RUN_PROFILE == "debug":
+    WRC_EPOCHS = 3
+    MAX_TRAIN_SHARDS = 24
+    MAX_VAL_SHARDS = 8
+    MAX_EVAL_BATCHES = 500
+else:  # full
+    WRC_EPOCHS = 5
+    MAX_TRAIN_SHARDS = None
+    MAX_VAL_SHARDS = None
+    MAX_EVAL_BATCHES = None
+
+    # ============================================================
+    # Stage 1 训练控制
+    # ============================================================
+    RESUME_STAGE1 = False  # False: 从头训练, True: 从 checkpoint 恢复
+    MAX_VAL_SHARDS = None  # None: 使用全部 val shards, 整数: 限制数量
+
+    # Stage 1 验证日（用于 day-holdout 验证）
+    # 如果为空，则使用随机 shard split
+    STAGE1_VAL_DAYS = ["11"]  # 使用 Day 11 作为验证日

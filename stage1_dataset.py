@@ -300,3 +300,44 @@ class ShardPrefetcher:
 
     def close(self):
         self.pool.shutdown(wait=True)
+
+def split_kfold_shards(n_splits=5, seed=42, val_ratio=0.15):
+    """
+    在训练 shard 上做 K 折，返回每折的 (train_shards, val_shards) 生成器。
+    注意：测试 shard 完全不参与 K 折，保持独立。
+    """
+
+    manifest = load_manifest()
+    all_shards = manifest.get("shards", [])
+
+    # 按日期分组（确保同一天的 shard 不被分散到不同折，避免数据泄露）
+    day_to_shards = {}
+    for s in all_shards:
+        day = s.get("day", "unknown")
+        day_to_shards.setdefault(day, []).append(s)
+
+    # 获取训练日期的 shard（排除测试日期）
+    from config import TRAIN_DAYS, TEST_DAYS
+    train_days_set = set(TRAIN_DAYS)
+
+    train_shards_all = []
+    for day in train_days_set:
+        train_shards_all.extend(day_to_shards.get(day, []))
+
+    # 打乱 shard 列表
+    random.seed(seed)
+    random.shuffle(train_shards_all)
+
+    # K 折拆分（在 shard 级别）
+    n_total = len(train_shards_all)
+    fold_size = n_total // n_splits
+
+    for fold_idx in range(n_splits):
+        start = fold_idx * fold_size
+        end = (fold_idx + 1) * fold_size if fold_idx < n_splits - 1 else n_total
+
+        val_shards = train_shards_all[start:end]
+        train_shards = train_shards_all[:start] + train_shards_all[end:]
+
+        log.info(f"K-Fold {fold_idx + 1}/{n_splits}: train={len(train_shards)}, val={len(val_shards)}")
+        yield train_shards, val_shards

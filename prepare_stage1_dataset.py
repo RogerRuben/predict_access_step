@@ -54,6 +54,15 @@ from logger import get_logger
 import re
 log = get_logger()
 
+from stage1_feature_schema import (
+    RAW_ID_FEATURES,
+    ORDINAL_RAW_FEATURES,
+    PERIODIC_FEATURES,
+    NON_STANDARDIZE_FEATURES,
+    ID_CLIP_RANGES,
+)
+# ★ 从 stage1_deep 导入 transform，或在此处复制
+
 # ============================================================
 # 路径与常量
 # ============================================================
@@ -257,33 +266,26 @@ def fit_global_stats(topo, available_days, sample_per_day=5000):
 # 标准化应用
 # ============================================================
 
+# 定义跳过标准化的特征（ID类）
+SKIP_FEATURES = {"link_id", "slice_id", "arrival_slice_est"}
+
+# 定义跳过标准化的特征（ID 类 + 状态类）
+SKIP_FEATURES = {"link_id", "slice_id", "arrival_slice_est", "link_current_status"}
+
+# ★ 导入轻量 transform
+from stage1_feature_transform import transform_stage1_feature_frame
+
 def apply_stats(df, feature_cols, mean_dict, std_dict):
     """
-    标准化规则（训练/验证/推理三路完全一致）:
-      - 周期特征 (sin/cos): 仅 clip 到 [-1, 1]
-      - 其余特征: Z-Score
+    返回 DataFrame，保留 order_id/day/_label 等非特征列。
     """
-    out = df.copy()
-    mean_s = pd.Series(mean_dict)
-    std_s  = pd.Series(std_dict)
-
-    x = out[feature_cols].copy()
-    x = x.replace([np.inf, -np.inf], np.nan)
-    x = x.fillna(mean_s)
-
-    for col in feature_cols:
-        if col in PERIODIC_FEATURES:
-            x[col] = x[col].clip(-1.0, 1.0)
-        else:
-            denom = std_s[col] if std_s[col] > 1e-8 else 1.0
-            x[col] = (x[col] - mean_s[col]) / denom
-
-    x = x.astype("float32")
-    x = x.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    out[feature_cols] = x
-    return out
-
+    return transform_stage1_feature_frame(
+        df=df,
+        feature_cols=feature_cols,
+        mean_dict=mean_dict,
+        std_dict=std_dict,
+    )
+#
 
 # ============================================================
 # manifest 工具
