@@ -4,7 +4,8 @@ import gc
 from logger import get_logger
 
 log = get_logger()
-
+from config import HIST_FEATURE_COLS, USE_HIST_CONTEXT
+from historical_context_loader import merge_historical_context
 # ============================================================
 # 特征列定义
 # ============================================================
@@ -45,7 +46,7 @@ STAGE1_FEATURE_COLS = [
     "is_status_unknown",  # link_current_status 是否为 0（未知）
     "status_x_time",  # 状态与时间的交互
 ]
-
+STAGE1_FEATURE_COLS = STAGE1_FEATURE_COLS + HIST_FEATURE_COLS
 STAGE1_TARGET = "link_arrival_status"
 
 STAGE2_EXTRACOLS = ["link_id", "link_time", "link_ratio", "downstream_cross_time"]
@@ -172,11 +173,40 @@ def build_stage1_features_batch(
     df["cos_arr_slice"] = np.cos(2 * np.pi * df["arrival_slice_est"] / 288).astype("float32")
 
     # ============================================================
-    # 8. 裁剪列
+    # 8. Historical link-slice context features
     # ============================================================
-    keep = list(set(STAGE1_FEATURE_COLS + [STAGE1_TARGET, "order_id", "day"]))
+    if USE_HIST_CONTEXT:
+        try:
+            df = merge_historical_context(df)
+        except Exception as e:
+            log.warning(f"[HistContext] merge failed, using empty hist features: {e}")
+            for col in HIST_FEATURE_COLS:
+                df[col] = 0.0
+            if "hist_missing" in HIST_FEATURE_COLS:
+                df["hist_missing"] = 1.0
+    else:
+        for col in HIST_FEATURE_COLS:
+            if col not in df.columns:
+                df[col] = 0.0
+        if "hist_missing" in HIST_FEATURE_COLS:
+            df["hist_missing"] = 1.0
+    # ============================================================
+    # 9. 裁剪列
+    # ============================================================
+    keep = STAGE1_FEATURE_COLS + [STAGE1_TARGET, "order_id", "day"]
+
     if keep_extra_for_stage2:
-        keep = list(set(keep + STAGE2_EXTRACOLS))
+        keep = keep + STAGE2_EXTRACOLS
+
+    keep = list(dict.fromkeys(keep))
+
+    for col in STAGE1_FEATURE_COLS:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    if "hist_missing" in STAGE1_FEATURE_COLS:
+        df["hist_missing"] = df["hist_missing"].fillna(1.0)
+
     df = df[[c for c in keep if c in df.columns]].copy()
 
     del grp

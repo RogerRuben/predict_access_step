@@ -41,9 +41,13 @@ import torch
 from datetime import datetime
 
 from config import (
-    BATCH_SIZE_ORDERS, STATUS_CLASSES,
-    TRAIN_DAYS, TEST_DAYS,
-    DATA_DIR, SPLIT_SUBDIRS,
+    STAGE1_PREP_BATCH_SIZE_ORDERS,
+    STAGE1_ORDERS_PER_SHARD,
+    STATUS_CLASSES,
+    TRAIN_DAYS,
+    TEST_DAYS,
+    DATA_DIR,
+    SPLIT_SUBDIRS,
 )
 from loader import load_day, load_topology
 from feature_eng import (
@@ -72,8 +76,8 @@ SHARD_DIR     = os.path.join(PREPARED_DIR, "shards")
 STATS_PATH    = os.path.join(PREPARED_DIR, "stats.json")
 MANIFEST_PATH = os.path.join(PREPARED_DIR, "manifest.json")
 
-SCHEMA_VERSION   = "stage1_seq_v4"
-ORDERS_PER_SHARD = 20000
+SCHEMA_VERSION   = "stage1_seq_v6_hist_base_win3"
+ORDERS_PER_SHARD = STAGE1_ORDERS_PER_SHARD
 SAVE_DTYPE       = np.float16
 
 # 周期特征不做 Z-Score，只 clip
@@ -82,6 +86,10 @@ PERIODIC_FEATURES = frozenset({
     "sin_arr_slice", "cos_arr_slice",
 })
 
+try:
+    from historical_context_loader import clear_historical_context_cache
+except Exception:
+    clear_historical_context_cache = None
 
 # ============================================================
 # 天数发现与校验
@@ -229,8 +237,9 @@ def fit_global_stats(topo, available_days, sample_per_day=5000):
             del head, link, cross, feat
             gc.collect()
 
-            # 两天样本通常足够稳定
-            if len(sampled_parts) >= 2:
+            MAX_STAT_DAYS = 4
+
+            if len(sampled_parts) >= min(MAX_STAT_DAYS, len(available_days)):
                 break
 
         except FileNotFoundError as e:
@@ -291,17 +300,41 @@ def apply_stats(df, feature_cols, mean_dict, std_dict):
 # manifest 工具
 # ============================================================
 
+def _same_feature_schema(saved_feature_cols):
+    return list(saved_feature_cols or []) == list(STAGE1_FEATURE_COLS)
+
 def load_existing_manifest():
-    """加载已有 manifest，不存在则返回空结构。"""
+    """加载已有 manifest；schema 不一致则丢弃旧 manifest。"""
     if os.path.exists(MANIFEST_PATH):
         with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
             manifest = json.load(f)
+
+        saved_schema = manifest.get("schema_version")
+        saved_features = manifest.get("feature_cols", [])
+
+        if saved_schema != SCHEMA_VERSION or not _same_feature_schema(saved_features):
+            log.warning(
+                "Existing manifest schema mismatch. Ignoring old manifest.\n"
+                f"  saved_schema={saved_schema}, current_schema={SCHEMA_VERSION}\n"
+                f"  saved_n_features={len(saved_features)}, current_n_features={len(STAGE1_FEATURE_COLS)}"
+            )
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "feature_cols": STAGE1_FEATURE_COLS,
+                "shards": [],
+            }
+
         n_shards = len(manifest.get("shards", []))
         existing_days = sorted(set(s["day"] for s in manifest.get("shards", [])))
         log.info(f"Existing manifest: {n_shards} shard(s), days={existing_days}")
         return manifest
+
     log.info("No existing manifest found, will create new one.")
-    return {"schema_version": SCHEMA_VERSION, "shards": []}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "feature_cols": STAGE1_FEATURE_COLS,
+        "shards": [],
+    }
 
 
 def get_existing_days(manifest):
@@ -375,8 +408,8 @@ def process_day_to_shards(day, topo, mean_dict, std_dict):
     total_orders = 0
     total_links = 0
 
-    for i in range(0, len(unique_orders), BATCH_SIZE_ORDERS):
-        batch_orders = unique_orders[i:i + BATCH_SIZE_ORDERS]
+    for i in range(0, len(unique_orders), STAGE1_PREP_BATCH_SIZE_ORDERS):
+        batch_orders = unique_orders[i:i + STAGE1_PREP_BATCH_SIZE_ORDERS]
         link_b  = link[link["order_id"].isin(batch_orders)]
         head_b  = head[head["order_id"].isin(batch_orders)]
         cross_b = cross[cross["order_id"].isin(batch_orders)]
@@ -437,6 +470,9 @@ def process_day_to_shards(day, topo, mean_dict, std_dict):
     del head, link, cross
     gc.collect()
 
+    if clear_historical_context_cache is not None:
+        clear_historical_context_cache()
+
     elapsed = time.time() - t0
     log.info(
         f"  Day {day} complete: {total_orders:,} orders, {total_links:,} links, "
@@ -489,19 +525,43 @@ def main():
     topo = load_topology()
 
     # ---- 1. 标准化参数 ----
+    need_refit_stats = True
+
     if os.path.exists(STATS_PATH):
-        log.info(f"Stats already exist: {STATS_PATH}, skip fitting.")
+        log.info(f"Stats found: {STATS_PATH}, checking schema ...")
         with open(STATS_PATH, "r", encoding="utf-8") as f:
             stats = json.load(f)
-        mean_dict = stats["mean"]
-        std_dict  = stats["std"]
-        log.info(f"  Loaded {len(stats.get('feature_cols', []))} feature columns from stats")
-    else:
-        log.info("Stats not found, fitting from scratch ...")
+
+        stats_schema = stats.get("schema_version")
+        stats_features = stats.get("feature_cols", [])
+
+        if stats_schema == SCHEMA_VERSION and _same_feature_schema(stats_features):
+            need_refit_stats = False
+            mean_dict = stats["mean"]
+            std_dict = stats["std"]
+            log.info(
+                f"  Stats schema matched: {stats_schema}, "
+                f"{len(stats_features)} feature columns"
+            )
+        else:
+            log.warning(
+                "  Stats schema mismatch. Will refit stats.\n"
+                f"    saved_schema={stats_schema}, current_schema={SCHEMA_VERSION}\n"
+                f"    saved_n_features={len(stats_features)}, current_n_features={len(STAGE1_FEATURE_COLS)}"
+            )
+
+    if need_refit_stats:
+        log.info("Stats not found or schema mismatch, fitting from scratch ...")
+
         all_days = _discover_available_days()
         if not all_days:
             raise RuntimeError("Cannot fit stats: no available days found.")
-        mean_dict, std_dict = fit_global_stats(topo, all_days)
+
+        stat_days = [d for d in all_days if d in set(TRAIN_DAYS)]
+        if not stat_days:
+            raise RuntimeError(f"No TRAIN_DAYS available for fitting stats. all_days={all_days}")
+
+        mean_dict, std_dict = fit_global_stats(topo, stat_days)
 
         with open(STATS_PATH, "w", encoding="utf-8") as f:
             json.dump({
@@ -513,6 +573,7 @@ def main():
                 "orders_per_shard": ORDERS_PER_SHARD,
                 "created_at": datetime.now().isoformat(),
             }, f, indent=2)
+
         log.info(f"Stats saved: {STATS_PATH}")
 
     # ---- 2. 加载已有 manifest ----

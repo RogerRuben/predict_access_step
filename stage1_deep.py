@@ -767,9 +767,14 @@ def evaluate_on_shards(model, shard_infos, device, criterion,
             break
 
         ds = SingleShardSequenceDataset(shard_obj, max_seq_len=max_seq_len)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=0,
-                            pin_memory=(device.type == "cuda"))
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=False,
+        )
 
         with torch.no_grad():
             for X_b, y_b, lens_b in loader:
@@ -896,9 +901,14 @@ def search_best_tau_and_temperature(model, val_shards, device, criterion,
         if shard_obj is None:
             break
         ds = SingleShardSequenceDataset(shard_obj, max_seq_len=max_seq_len)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=0,
-                            pin_memory=(device.type == "cuda"))
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=False,
+        )
         with torch.no_grad():
             for X_b, y_b, lens_b in loader:
                 X_b = X_b.to(device, non_blocking=True)
@@ -1250,7 +1260,7 @@ def train_wrc_from_shards(
                 sampler=sampler,
                 collate_fn=collate_fn,
                 num_workers=0,
-                pin_memory=(device.type == "cuda"),
+                pin_memory=False,
             )
 
             w_arr = np.array(ds.sample_weights)
@@ -1336,6 +1346,10 @@ def train_wrc_from_shards(
                     )
 
             del ds, loader, shard_obj
+            gc.collect()
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if sc % 30 == 0:
                 gc.collect()
                 if device.type == "cuda":

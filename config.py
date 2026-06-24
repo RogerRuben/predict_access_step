@@ -21,9 +21,10 @@ SPLIT_SUBDIRS = {
 # TEST_DAYS  = ["31"]
 
 # 日期配置 —— 保守版本，排除 Day 07（内存问题）和 Day 08/09/10（缺失）
-TRAIN_DAYS = ["01", "02", "04", "05", "06", "11"]
+# TRAIN_DAYS = ["01", "02", "04", "05", "06", "11"]
+# TEST_DAYS = ["13"]
+TRAIN_DAYS = ["01", "06", "11"]
 TEST_DAYS = ["13"]
-
 # 如果后续确认 Day 07 问题修复，可加回
 # 如果确认 Day 31 数据存在，可切换测试日
 
@@ -110,14 +111,39 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 STAGE1_MODEL = "wdr"   # 或 "wrc"
 # WRC 超参数
+# WRC_HIDDEN_DIM = 128
+# WRC_NUM_LAYERS = 2
+# WRC_BATCH_SIZE = 256
+# WRC_EPOCHS = 5
+# WRC_LR = 8e-4
+# WRC_MAX_SEQ_LEN = 200
+# # DataLoader
+# num_workers = 2
 WRC_HIDDEN_DIM = 128
 WRC_NUM_LAYERS = 2
-WRC_BATCH_SIZE = 512
-WRC_EPOCHS = 5
+WRC_BATCH_SIZE = 128
+WRC_EPOCHS = 2
 WRC_LR = 8e-4
-WRC_MAX_SEQ_LEN = 200
-# DataLoader
-num_workers = 2
+WRC_MAX_SEQ_LEN = 180
+num_workers = 0
+# ============================================================
+# Stage1 prepare / training memory control
+# ============================================================
+
+# prepare 每批构造多少订单特征。
+# 影响 prepare 速度和单批 DataFrame 内存。
+STAGE1_PREP_BATCH_SIZE_ORDERS = 5000
+
+# 每个 .pt shard 保存多少订单。
+# 影响 Stage1 训练时一次加载多少序列进 RAM。
+# 当前 20000 对 16GB RAM + hist features 偏大。
+STAGE1_ORDERS_PER_SHARD = 5000
+
+# Stage2 继续保持小 batch，避免单日 Stage2 爆内存。
+STAGE2_BATCH_SIZE_ORDERS = 1000
+
+# 兼容旧代码
+BATCH_SIZE_ORDERS = STAGE2_BATCH_SIZE_ORDERS
 
 # ============================================================
 # Stage 1 WDR 安全损失与安全决策
@@ -156,8 +182,69 @@ SKIP_TAU_SEARCH = False          # True: 跳过搜索，使用默认值；False:
 DEFAULT_TAU = 0.55              # 默认 tau 值
 DEFAULT_TEMPERATURE = 1.0       # 默认温度值
 
+# ============================================================
+# Historical Link-Slice Context Features
+# ============================================================
+
+USE_HIST_CONTEXT = True
+
+HIST_CONTEXT_VERSION = "v1"
+HIST_CONTEXT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "prepared_data",
+    "historical_context",
+)
+
+# 可自由设置时间窗，单位是 slice 数。
+# 每个 slice 约 5 分钟，因此：
+# 1 = ±5min, 3 = ±15min, 6 = ±30min
+HIST_CONTEXT_WINDOWS = [3]
+
+# Bayesian smoothing prior
+HIST_SMOOTH_PRIOR = 50.0
+HIST_COND_SMOOTH_PRIOR = 30.0
+
+# 是否使用 arrival_slice_est 作为历史上下文时间键。
+# True: link 到达该 link 时的估计 slice，更接近预测目标。
+# False: 使用订单出发 slice_id，更稳但粗一些。
+HIST_USE_ARRIVAL_SLICE = True
+
+# 历史特征列
+HIST_BASE_FEATURE_COLS = [
+    "hist_status_mean",
+    "hist_cong_prob",
+    "hist_s4_prob",
+    "hist_entropy",
+    "hist_link_time_mean",
+    "hist_link_time_std",
+    "hist_n_log",
+    "hist_missing",
+]
+
+HIST_COND_FEATURE_COLS = [
+    "hist_cur_cong_prob",
+    "hist_cur_s4_prob",
+    "hist_worse_prob",
+    "hist_delta_status_mean",
+]
+
+# 根据 HIST_CONTEXT_WINDOWS 自动生成窗口特征
+HIST_WINDOW_FEATURE_COLS = []
+for _k in HIST_CONTEXT_WINDOWS:
+    HIST_WINDOW_FEATURE_COLS += [
+        f"hist_cong_win{_k}",
+        f"hist_s4_win{_k}",
+        f"hist_status_win{_k}",
+    ]
+
+HIST_FEATURE_COLS = (
+    HIST_BASE_FEATURE_COLS
+    + HIST_WINDOW_FEATURE_COLS
+    + HIST_COND_FEATURE_COLS
+)
+
 # 运行模式
-RUN_PROFILE = "smoke"   # smoke / debug / full
+RUN_PROFILE = "debug"   # smoke / debug / full
 
 if RUN_PROFILE == "smoke":
     WRC_EPOCHS = 2
@@ -175,12 +262,83 @@ else:  # full
     MAX_VAL_SHARDS = None
     MAX_EVAL_BATCHES = None
 
-    # ============================================================
-    # Stage 1 训练控制
-    # ============================================================
-    RESUME_STAGE1 = False  # False: 从头训练, True: 从 checkpoint 恢复
-    MAX_VAL_SHARDS = None  # None: 使用全部 val shards, 整数: 限制数量
+# ============================================================
+# Stage 1 训练控制
+# ============================================================
+RESUME_STAGE1 = False  # False: 从头训练, True: 从 checkpoint 恢复
+MAX_VAL_SHARDS = None  # None: 使用全部 val shards, 整数: 限制数量
 
-    # Stage 1 验证日（用于 day-holdout 验证）
-    # 如果为空，则使用随机 shard split
-    STAGE1_VAL_DAYS = ["11"]  # 使用 Day 11 作为验证日
+# Stage 1 验证日（用于 day-holdout 验证）
+# 如果为空，则使用随机 shard split
+STAGE1_VAL_DAYS = ["11"]  # 使用 Day 11 作为验证日
+# ============================================================
+# Batch sizes
+# ============================================================
+
+# ============================================================
+# Stage1 prepare / Stage2 batch size split
+# ============================================================
+
+STAGE1_PREP_BATCH_SIZE_ORDERS = 5000
+STAGE2_BATCH_SIZE_ORDERS = 1000
+BATCH_SIZE_ORDERS = STAGE2_BATCH_SIZE_ORDERS
+HIST_BUILD_BATCH_SIZE_ORDERS = 5000
+
+# ============================================================
+# Historical context
+# ============================================================
+
+USE_HIST_CONTEXT = True
+
+HIST_CONTEXT_VERSION = "v1_base_win1_3"
+
+HIST_CONTEXT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "prepared_data",
+    "historical_context",
+)
+
+# 这次命令用的是 --windows 3，所以 config 也必须一致
+HIST_CONTEXT_WINDOWS = [3]
+
+# 按 link_id 分桶，避免 target context 合并时爆内存
+HIST_N_BUCKETS = 32
+
+# loader 阶段最多缓存几个 bucket
+# 如果 prepare 很慢且内存还够，可改成 16 或 32
+HIST_BUCKET_CACHE_SIZE = 8
+
+# target context 里历史样本数太少的 key 直接丢弃，prepare 时走 fallback
+# 因为 prior=50，hist_n=1 的信息本来也很弱
+HIST_TARGET_MIN_COUNT = 2
+
+HIST_SMOOTH_PRIOR = 50.0
+HIST_USE_ARRIVAL_SLICE = True
+
+HIST_BASE_FEATURE_COLS = [
+    "hist_status_mean",
+    "hist_cong_prob",
+    "hist_s4_prob",
+    "hist_entropy",
+    "hist_link_time_mean",
+    "hist_link_time_std",
+    "hist_n_log",
+    "hist_missing",
+]
+
+HIST_WINDOW_FEATURE_COLS = []
+for _k in HIST_CONTEXT_WINDOWS:
+    HIST_WINDOW_FEATURE_COLS += [
+        f"hist_cong_win{_k}",
+        f"hist_s4_win{_k}",
+        f"hist_status_win{_k}",
+    ]
+
+# 第一版先不要 conditional
+HIST_COND_FEATURE_COLS = []
+
+HIST_FEATURE_COLS = (
+    HIST_BASE_FEATURE_COLS
+    + HIST_WINDOW_FEATURE_COLS
+    + HIST_COND_FEATURE_COLS
+)
