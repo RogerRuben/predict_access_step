@@ -21,9 +21,10 @@ SPLIT_SUBDIRS = {
 # TEST_DAYS  = ["31"]
 
 # 日期配置 —— 保守版本，排除 Day 07（内存问题）和 Day 08/09/10（缺失）
-# TRAIN_DAYS = ["01", "02", "04", "05", "06", "11"]
+# TRAIN_DAYS = ["01", "02", "04", "06", "11"]
 # TEST_DAYS = ["13"]
-TRAIN_DAYS = ["01", "06", "11"]
+TRAIN_DAYS = ["01", "05","06", "11"]
+
 TEST_DAYS = ["13"]
 # 如果后续确认 Day 07 问题修复，可加回
 # 如果确认 Day 31 数据存在，可切换测试日
@@ -124,8 +125,10 @@ WRC_NUM_LAYERS = 2
 WRC_BATCH_SIZE = 128
 WRC_EPOCHS = 2
 WRC_LR = 8e-4
-WRC_MAX_SEQ_LEN = 180
+WRC_MAX_SEQ_LEN = 200
 num_workers = 0
+
+
 # ============================================================
 # Stage1 prepare / training memory control
 # ============================================================
@@ -244,7 +247,7 @@ HIST_FEATURE_COLS = (
 )
 
 # 运行模式
-RUN_PROFILE = "debug"   # smoke / debug / full
+RUN_PROFILE = "smoke"   # smoke / debug / full
 
 if RUN_PROFILE == "smoke":
     WRC_EPOCHS = 2
@@ -252,12 +255,12 @@ if RUN_PROFILE == "smoke":
     MAX_VAL_SHARDS = 4
     MAX_EVAL_BATCHES = 200
 elif RUN_PROFILE == "debug":
-    WRC_EPOCHS = 3
-    MAX_TRAIN_SHARDS = 24
-    MAX_VAL_SHARDS = 8
+    WRC_EPOCHS = 8
+    MAX_TRAIN_SHARDS = 48
+    MAX_VAL_SHARDS = 20
     MAX_EVAL_BATCHES = 500
 else:  # full
-    WRC_EPOCHS = 5
+    WRC_EPOCHS = 8
     MAX_TRAIN_SHARDS = None
     MAX_VAL_SHARDS = None
     MAX_EVAL_BATCHES = None
@@ -265,8 +268,8 @@ else:  # full
 # ============================================================
 # Stage 1 训练控制
 # ============================================================
-RESUME_STAGE1 = False  # False: 从头训练, True: 从 checkpoint 恢复
-MAX_VAL_SHARDS = None  # None: 使用全部 val shards, 整数: 限制数量
+RESUME_STAGE1 = True  # False: 从头训练, True: 从 checkpoint 恢复
+
 
 # Stage 1 验证日（用于 day-holdout 验证）
 # 如果为空，则使用随机 shard split
@@ -280,10 +283,10 @@ STAGE1_VAL_DAYS = ["11"]  # 使用 Day 11 作为验证日
 # ============================================================
 
 STAGE1_PREP_BATCH_SIZE_ORDERS = 5000
-STAGE2_BATCH_SIZE_ORDERS = 1000
+STAGE2_BATCH_SIZE_ORDERS = 3000
 BATCH_SIZE_ORDERS = STAGE2_BATCH_SIZE_ORDERS
 HIST_BUILD_BATCH_SIZE_ORDERS = 5000
-
+WRC_INFER_BATCH_SIZE = 512
 # ============================================================
 # Historical context
 # ============================================================
@@ -342,3 +345,18 @@ HIST_FEATURE_COLS = (
     + HIST_WINDOW_FEATURE_COLS
     + HIST_COND_FEATURE_COLS
 )
+
+
+
+
+MAX_TRAIN_SHARDS = None
+MAX_VAL_SHARDS = None
+
+WRC_EPOCHS = 8
+
+S4_AUX_WEIGHT = 0.0
+S4_AUX_START_EPOCH = 3
+S4_AUX_RAMP_EPOCHS = 2
+UNDER_AUX_WEIGHT = 0.02
+UNDER_AUX_START_EPOCH = 3
+UNDER_AUX_RAMP_EPOCHS = 3

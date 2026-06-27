@@ -16,7 +16,7 @@ from config import STAGE1_MODEL
 from loader import load_topology
 from pipeline import _process_day_stage2
 from logger import get_logger
-
+from config import WRC_MAX_SEQ_LEN, WRC_INFER_BATCH_SIZE
 log = get_logger()
 
 

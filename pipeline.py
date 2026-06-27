@@ -311,6 +311,55 @@ def _cache_paths(cache_key):
         os.path.join(CACHE_DIR, f"head_{cache_key}.pkl"),
     )
 
+def _run_difficulty_validation_split(df, split_name: str):
+    """
+    对 train/test 分别运行 difficulty validation，并单独保存 JSON。
+    注意 generate_validation_report 内部可能仍保存默认 validation_report.json；
+    这里额外保存 split-specific report，避免 train/test 混淆。
+    """
+    import json
+    import os
+    import pandas as pd
+    from evaluation.difficulty_validation import (
+        generate_validation_report,
+        extreme_weather_validation,
+    )
+
+    split_name = str(split_name).lower()
+
+    log.info("\n" + "=" * 70)
+    log.info(f"RUNNING DIFFICULTY VALIDATION [{split_name.upper()}]")
+    log.info("=" * 70)
+
+    if df is None or df.empty:
+        log.warning(f"[Stage3-{split_name}] empty dataframe, skip validation.")
+        return {
+            "split": split_name,
+            "n": 0,
+            "report": None,
+            "extreme_weather": None,
+        }
+
+    report = generate_validation_report(df)
+    extreme_results = extreme_weather_validation(df)
+
+    out = {
+        "split": split_name,
+        "n": int(len(df)),
+        "report": report,
+        "extreme_weather": extreme_results,
+        "timestamp": pd.Timestamp.now().isoformat(),
+    }
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    out_path = os.path.join(RESULTS_DIR, f"validation_report_{split_name}.json")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2, default=str)
+
+    log.info(f"[Stage3-{split_name}] validation report saved: {out_path}")
+
+    return out
 
 def _stage2_cache_exists(day, s1_model_path, ct_threshold, cross_global_mean):
     cache_key = _make_cache_key(
@@ -607,6 +656,7 @@ def _run_stage1_train(topo):
     else:
         if STAGE1_MODEL in ("wrc", "wdr", "hierarchical", "hier", "ordinal", "dualhead", "triple", "cascade"):
             from stage1_deep import train_wrc_from_shards, save_wrc_model
+            from config import RESUME_STAGE1
             log.info("=" * 70)
             log.info("STAGE 1: Single Training (no K-Fold)")
             log.info("=" * 70)
@@ -617,6 +667,7 @@ def _run_stage1_train(topo):
                 epochs=WRC_EPOCHS,
                 lr=WRC_LR,
                 max_seq_len=WRC_MAX_SEQ_LEN,
+                resume=RESUME_STAGE1,
             )
             model_path = save_wrc_model(model, tag="v1")
             return model, model_path
@@ -853,6 +904,76 @@ def _compute_global_cross_stats(train_days):
     log.info(f"  cross_time global_mean = {cross_global_mean:.2f}s")
     return ct_threshold, cross_global_mean
 
+#stage3def
+
+def _dedup_keep_order(cols):
+    seen = set()
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _make_stage3_v2_input(df, s2_cols):
+    """
+    Save a clean Stage3-v2 input table:
+    - keeps Stage2 features and service outcome columns
+    - excludes old Stage3 output scores to avoid leakage
+    """
+    out = df.copy()
+
+    required_supervision = ["ata", "simple_eta"]
+    missing = [c for c in required_supervision if c not in out.columns]
+    if missing:
+        raise ValueError(
+            f"Cannot create Stage3-v2 input. Missing supervision columns: {missing}"
+        )
+
+    out["ata"] = pd.to_numeric(out["ata"], errors="coerce")
+    out["simple_eta"] = pd.to_numeric(out["simple_eta"], errors="coerce")
+
+    eta_safe = out["simple_eta"].clip(lower=1e-6)
+    out["ata_over_eta"] = out["ata"] / eta_safe
+    out["eta_delay"] = np.maximum(out["ata_over_eta"] - 1.0, 0.0)
+
+    base_cols = [
+        "order_id",
+        "day",
+        "ata",
+        "simple_eta",
+        "ata_over_eta",
+        "eta_delay",
+        "distance",
+        "driver_id",
+        "slice_id",
+    ]
+
+    # Keep weather columns if they exist, even if not included in S2_COLS.
+    extra_cols = [
+        "weather_severity",
+        "temp_avg",
+        "temp_range",
+        "is_extreme_weather",
+        "is_high_temp",
+        "is_low_temp",
+    ]
+
+    keep_cols = []
+    keep_cols += [c for c in base_cols if c in out.columns]
+    keep_cols += [c for c in s2_cols if c in out.columns]
+    keep_cols += [c for c in extra_cols if c in out.columns]
+    keep_cols = _dedup_keep_order(keep_cols)
+
+    if len([c for c in s2_cols if c in out.columns]) < 8:
+        log.warning(
+            f"[Stage3-v2 input] Only found "
+            f"{len([c for c in s2_cols if c in out.columns])} Stage2 feature columns. "
+            f"Please check S2_COLS and train_final/test_final columns."
+        )
+
+    return out[keep_cols].copy()
 
 # ============================================================
 # 主流程
@@ -983,6 +1104,7 @@ def run_pipeline(mode: str = "train"):
         )
         log.info(f"Day {day}: parent expects cache_key={cache_key}")
         s2_cache, head_cache = _cache_paths(cache_key)
+        import os 
         if os.path.exists(s2_cache) and os.path.exists(head_cache):
             s2 = pd.read_pickle(s2_cache)
             head = pd.read_pickle(head_cache)
@@ -1073,12 +1195,24 @@ def run_pipeline(mode: str = "train"):
             'driver_id': 0,
             'slice_id': 0,
         }
+# 训练监督列不能用默认值伪造
+        missing_sup = [c for c in ["ata", "simple_eta"] if c not in train_final.columns]
+        if missing_sup:
+            raise ValueError(
+                f"Stage3 training requires real supervision columns {missing_sup}, "
+                f"but they are missing before ensure_columns()."
+            )
+
         train_final = ensure_columns(train_final, required_cols, default_values)
         log.info(f"Stage 3 training data: {len(train_final)} rows, {len(train_final.columns)} columns")
 
+        # 保存 Stage3-v2 的干净输入表：只含 Stage2 features + 真实 outcome，不含旧 Stage3 输出
+        train_stage3_v2_input = _make_stage3_v2_input(train_final, S2_COLS)
+
         # ---- 2. 训练模型 ----
         diff_model.fit(train_final)
-        diff_model.save(tag='v2_xgb')
+
+        diff_model.save(tag='v_xgb')
 
 
 
@@ -1105,8 +1239,20 @@ def run_pipeline(mode: str = "train"):
         if test_final.empty:
             raise ValueError("No data after merging test_s2 and test_head_slim.")
 
+        missing_sup = [c for c in ["ata", "simple_eta"] if c not in test_final.columns]
+        if missing_sup:
+            raise ValueError(
+                f"Stage3 test validation requires real supervision columns {missing_sup}, "
+                f"but they are missing before ensure_columns()."
+            )
+
         test_final = ensure_columns(test_final, required_cols, default_values)
+
+        # 保存 Stage3-v2 的干净输入表：只含 Stage2 features + 真实 outcome，不含旧 Stage3 输出
+        test_stage3_v2_input = _make_stage3_v2_input(test_final, S2_COLS)
+
         test_pred = diff_model.predict(test_final)
+
         test_final['difficulty'] = test_pred['difficulty']
         test_final['grade'] = test_pred['grade']
         test_final['bti_score'] = test_pred['bti_score']
@@ -1129,30 +1275,50 @@ def run_pipeline(mode: str = "train"):
         # ---- 5. 生成 SHAP 解释和验证报告 ----
         diff_model.explain(train_final, output_dir=FIGURES_DIR)
 
-        from evaluation.difficulty_validation import generate_validation_report, extreme_weather_validation
-        log.info("\n" + "=" * 70)
-        log.info("RUNNING DIFFICULTY VALIDATION (Paper-Grade)")
-        log.info("=" * 70)
-
-        report = generate_validation_report(train_final)
-        extreme_results = extreme_weather_validation(train_final)
-
         import json
-        full_report = {
-            'report': report,
-            'extreme_weather': extreme_results,
-            'thresholds': {
-                'safety_threshold': diff_model.safety_threshold,
-                'boundary_g1g2': diff_model.boundaries[0] if diff_model.boundaries else None,
-                'boundary_g2g3': diff_model.boundaries[1] if diff_model.boundaries else None,
-                'entropy_weights': diff_model.entropy_weights,
-            },
-            'timestamp': pd.Timestamp.now().isoformat()
-        }
+        import os
+
         os.makedirs(RESULTS_DIR, exist_ok=True)
-        with open(os.path.join(RESULTS_DIR, 'validation_report_full.json'), 'w') as f:
-            json.dump(full_report, f, indent=2, default=str)
-        log.info(f"Full validation report saved to {RESULTS_DIR}/validation_report_full.json")
+
+        stage3_v2_train_path = os.path.join(RESULTS_DIR, "stage3_v2_input_train.csv")
+        stage3_v2_test_path = os.path.join(RESULTS_DIR, "stage3_v2_input_test.csv")
+
+        train_stage3_v2_input.to_csv(stage3_v2_train_path, index=False)
+        test_stage3_v2_input.to_csv(stage3_v2_test_path, index=False)
+
+        log.info(f"Stage3-v2 train input saved to {stage3_v2_train_path} "
+                f"({len(train_stage3_v2_input)} rows, {len(train_stage3_v2_input.columns)} cols)")
+        log.info(f"Stage3-v2 test input saved to {stage3_v2_test_path} "
+                f"({len(test_stage3_v2_input)} rows, {len(test_stage3_v2_input.columns)} cols)")
+
+        train_report = _run_difficulty_validation_split(train_final, "train")
+        test_report = _run_difficulty_validation_split(test_final, "test")
+
+        full_report = {
+            "reports": {
+                "train": train_report,
+                "test": test_report,
+            },
+            "thresholds": {
+                "safety_threshold": diff_model.safety_threshold,
+                "boundary_g1g2": diff_model.boundaries[0] if diff_model.boundaries else None,
+                "boundary_g2g3": diff_model.boundaries[1] if diff_model.boundaries else None,
+                "entropy_weights": diff_model.entropy_weights,
+            },
+            "stage3_model": {
+                "feature_cols": getattr(diff_model, "feature_cols", None),
+                "all_cols_ordered": getattr(diff_model, "all_cols_ordered", None),
+            },
+            "timestamp": pd.Timestamp.now().isoformat(),
+        }
+
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        full_path = os.path.join(RESULTS_DIR, "validation_report_full.json")
+
+        with open(full_path, "w", encoding="utf-8") as f:
+            json.dump(full_report, f, ensure_ascii=False, indent=2, default=str)
+
+        log.info(f"Full validation report saved to {full_path}")
 
     else:
         # ---- 测试模式：加载模型并预测 ----
@@ -1189,9 +1355,20 @@ def run_pipeline(mode: str = "train"):
         train_final = None
 
     # ---- 保存结果 ----
-    output_cols = ['order_id', 'day', 'difficulty', 'grade', 'bti_score', 'safety_score']
-    test_final[output_cols].to_csv('difficulty_test.csv', index=False)
-    log.info(f"Test results saved to difficulty_test.csv ({len(test_final)} orders)")
+    output_cols = ["order_id", "day"] + [
+        c for c in stage3_output_cols if c in test_final.columns
+    ]
+
+    test_final[output_cols].to_csv("difficulty_test.csv", index=False)
+    log.info(f"Test slim results saved to difficulty_test.csv ({len(test_final)} orders)")
+
+    if train_final is not None:
+        train_output_cols = ["order_id", "day"] + [
+            c for c in stage3_output_cols if c in train_final.columns
+        ]
+        train_final[train_output_cols].to_csv("difficulty_train.csv", index=False)
+        log.info(f"Train slim results saved to difficulty_train.csv ({len(train_final)} orders)")
+        log.info(f"Test results saved to difficulty_test.csv ({len(test_final)} orders)")
 
     if train_final is not None:
         train_final[output_cols].to_csv('difficulty_train.csv', index=False)

@@ -497,13 +497,16 @@ class CascadeLoss(nn.Module):
 
     def forward(self, lq1, lq2, lq3, cls_logits, bnd_logit, ng_logit, targets):
         y_flat = targets.reshape(-1)
-        valid  = y_flat != self.ignore_index
+        valid = y_flat != self.ignore_index
+
+        dev = y_flat.device
+        zero = torch.tensor(0.0, device=dev)
 
         if valid.sum() == 0:
-            zero = torch.tensor(0.0, device=y_flat.device)
-            return zero, zero, zero, zero, zero, zero, zero, zero  # ★ 增加一个 zero
+            return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
-        y = y_flat[valid]
+        y = y_flat[valid].long()
+
         ngf = ng_logit.reshape(-1)[valid]
         q1f = lq1.reshape(-1)[valid]
         q2f = lq2.reshape(-1)[valid]
@@ -511,24 +514,75 @@ class CascadeLoss(nn.Module):
         clf = cls_logits.reshape(-1, NUM_CLASSES)[valid]
         bndf = bnd_logit.reshape(-1)[valid]
 
-        dev = y.device
+        # ============================================================
+        # 0. L_seq_cls：逐时间步分类辅助，覆盖所有有效 link
+        # ============================================================
+        cls_logits_flat = cls_logits.reshape(-1, NUM_CLASSES)
+        targets_flat = targets.reshape(-1).long()
 
-        # ---- 1. L_ng (全样本) ----
-        ng_target = (y >= 1).float()
-        n_neg = (y == 0).sum().float()
-        n_pos = (y >= 1).sum().float()
-        pos_weight = (n_neg / max(n_pos, 1)).clamp(1.0, 20.0)
-        l_ng = F.binary_cross_entropy_with_logits(
-            ngf, ng_target,
-            pos_weight=torch.tensor(pos_weight, device=dev),
-            reduction="mean"
+        l_seq_cls = F.cross_entropy(
+            cls_logits_flat,
+            targets_flat,
+            ignore_index=self.ignore_index,
+            reduction="mean",
         )
 
-        # ---- 仅对 non-s1 样本计算后续损失 ----
-        non_s1_mask = (y >= 1)
+        # ============================================================
+        # 1. L_ng：s1 vs non-s1，全样本
+        # ============================================================
+        ng_target = (y >= 1).float()
+
+        n_neg = (y == 0).sum().float()
+        n_pos = (y >= 1).sum().float()
+        pos_weight = (n_neg / torch.clamp(n_pos, min=1.0)).clamp(1.0, 20.0)
+
+        l_ng = F.binary_cross_entropy_with_logits(
+            ngf,
+            ng_target,
+            pos_weight=pos_weight.to(device=dev),
+            reduction="mean",
+        )
+
+        # ============================================================
+        # 2. L_under：underestimation-aware loss，全样本
+        #    使用 ng + q2 + q3 形成期望严重度
+        # ============================================================
+        p_ng = torch.sigmoid(ngf)
+        p_q2 = torch.sigmoid(q2f)
+        p_q3 = torch.sigmoid(q3f)
+
+        # 这里不使用 q1，因为你当前 q1 只在 non-s1 上 target=1，
+        # 真正的 s1/non-s1 由 ng_logit 负责。
+        p1 = 1.0 - p_ng
+        p2 = p_ng * (1.0 - p_q2)
+        p3 = p_ng * p_q2 * (1.0 - p_q3)
+        p4 = p_ng * p_q2 * p_q3
+
+        pred_sev = 0.0 * p1 + 1.0 * p2 + 2.0 * p3 + 3.0 * p4
+        true_sev = y.float()
+
+        under = torch.relu(true_sev - pred_sev)
+
+        under_class_weights = torch.tensor(
+            [0.0, 0.4, 1.0, 2.0],
+            device=dev,
+            dtype=pred_sev.dtype,
+        )
+
+        under_w = under_class_weights[y].clamp_min(0.0)
+
+        if under_w.sum() > 0:
+            l_under = (under_w * under.pow(2)).sum() / under_w.sum().clamp_min(1.0)
+        else:
+            l_under = zero
+
+        # ============================================================
+        # 后续损失只对 non-s1 样本
+        # ============================================================
+        non_s1_mask = y >= 1
+
         if non_s1_mask.sum() == 0:
-            zero = torch.tensor(0.0, device=dev)
-            return l_ng, zero, zero, zero, zero, zero, zero, zero  # ★ 增加一个 zero
+            return l_ng, zero, zero, zero, zero, zero, zero, l_seq_cls, zero, l_under
 
         y_ns = y[non_s1_mask]
         q1f_ns = q1f[non_s1_mask]
@@ -537,32 +591,87 @@ class CascadeLoss(nn.Module):
         clf_ns = clf[non_s1_mask]
         bndf_ns = bndf[non_s1_mask]
 
+        # ============================================================
+        # 3. Optional S4 recall auxiliary
+        # ============================================================
+        s4_mask_ns = y_ns == 3
+
+        if s4_mask_ns.sum() > 0:
+            l_s4 = F.binary_cross_entropy_with_logits(
+                q3f_ns[s4_mask_ns],
+                torch.ones_like(q3f_ns[s4_mask_ns]),
+                reduction="mean",
+            )
+        else:
+            l_s4 = zero
+
         class_weights = self._compute_class_weights(y_ns, num_classes=NUM_CLASSES)
 
-        # ---- 2. L_ord ----
-        l_q1 = self._focal_bce(q1f_ns, torch.ones_like(y_ns, dtype=torch.float), self.pw_q1, self.gamma_q1)
-        l_q2 = self._focal_bce(q2f_ns, (y_ns >= 2).float(), self.pw_q2, self.gamma_q2)
-        l_q3 = self._focal_bce(q3f_ns, (y_ns >= 3).float(), self.pw_q3, self.gamma_q3)
+        # ============================================================
+        # 4. L_ord
+        # ============================================================
+        l_q1 = self._focal_bce(
+            q1f_ns,
+            torch.ones_like(y_ns, dtype=torch.float),
+            self.pw_q1,
+            self.gamma_q1,
+        )
+
+        l_q2 = self._focal_bce(
+            q2f_ns,
+            (y_ns >= 2).float(),
+            self.pw_q2,
+            self.gamma_q2,
+        )
+
+        l_q3 = self._focal_bce(
+            q3f_ns,
+            (y_ns >= 3).float(),
+            self.pw_q3,
+            self.gamma_q3,
+        )
+
         l_ord = l_q1 + l_q2 + l_q3
 
-        # ---- 3. L_cls ----
-        l_cls = self._focal_ce(clf_ns, y_ns, self.cls_alpha, self.gamma_cls, class_weights=class_weights)
+        # ============================================================
+        # 5. L_cls
+        # ============================================================
+        l_cls = self._focal_ce(
+            clf_ns,
+            y_ns,
+            self.cls_alpha,
+            self.gamma_cls,
+            class_weights=class_weights,
+        )
 
-        # ---- 4. L_bnd ----
+        # ============================================================
+        # 6. L_bnd: s2 vs s3
+        # ============================================================
         mid_mask_ns = (y_ns == 1) | (y_ns == 2)
+
         if mid_mask_ns.sum() > 0:
             bnd_target = (y_ns[mid_mask_ns] == 2).float()
-            bce_bnd = F.binary_cross_entropy_with_logits(bndf_ns[mid_mask_ns], bnd_target, reduction="none")
+
+            bce_bnd = F.binary_cross_entropy_with_logits(
+                bndf_ns[mid_mask_ns],
+                bnd_target,
+                reduction="none",
+            )
+
             if self.gamma_bnd > 0:
-                p_b  = torch.sigmoid(bndf_ns[mid_mask_ns])
-                pt_b = p_b * bnd_target + (1 - p_b) * (1 - bnd_target)
-                bce_bnd = (1 - pt_b).pow(self.gamma_bnd) * bce_bnd
+                p_b = torch.sigmoid(bndf_ns[mid_mask_ns])
+                pt_b = p_b * bnd_target + (1.0 - p_b) * (1.0 - bnd_target)
+                bce_bnd = (1.0 - pt_b).pow(self.gamma_bnd) * bce_bnd
+
             l_bnd = bce_bnd.mean()
         else:
-            l_bnd = torch.tensor(0.0, device=dev)
+            l_bnd = zero
 
-        # ---- 5. L_align ----
+        # ============================================================
+        # 7. L_align
+        # ============================================================
         p_cls = F.softmax(clf_ns, dim=-1)
+
         f_cls_1 = p_cls[:, 1] + p_cls[:, 2] + p_cls[:, 3]
         f_cls_2 = p_cls[:, 2] + p_cls[:, 3]
         f_cls_3 = p_cls[:, 3]
@@ -573,50 +682,60 @@ class CascadeLoss(nn.Module):
             q3_detach = torch.sigmoid(q3f_ns)
 
         l_align = (
-            F.mse_loss(f_cls_1, q1_detach) +
-            F.mse_loss(f_cls_2, q2_detach) +
-            F.mse_loss(f_cls_3, q3_detach)
+            F.mse_loss(f_cls_1, q1_detach)
+            + F.mse_loss(f_cls_2, q2_detach)
+            + F.mse_loss(f_cls_3, q3_detach)
         ) / 3.0
 
-        # ---- 6. L_sharp ----
+        # ============================================================
+        # 8. L_sharp
+        # ============================================================
         if mid_mask_ns.sum() > 0:
             sharp_target = (y_ns[mid_mask_ns] == 2).float()
+
             l_sharp = F.binary_cross_entropy_with_logits(
-                q2f_ns[mid_mask_ns], sharp_target, reduction="mean"
+                q2f_ns[mid_mask_ns],
+                sharp_target,
+                reduction="mean",
             )
         else:
-            l_sharp = torch.tensor(0.0, device=dev)
+            l_sharp = zero
 
-        # ---- 7. L_boundary ----
+        # ============================================================
+        # 9. L_boundary
+        # ============================================================
         if mid_mask_ns.sum() > 0:
             q2_vals = torch.sigmoid(q2f_ns[mid_mask_ns])
             q3_vals = torch.sigmoid(q3f_ns[mid_mask_ns])
+
             diff = q2_vals - q3_vals
+
             target_diff = torch.where(
                 y_ns[mid_mask_ns] == 1,
-                torch.tensor(0.4, device=dev),
-                torch.tensor(-0.2, device=dev)
+                torch.tensor(0.4, device=dev, dtype=diff.dtype),
+                torch.tensor(-0.2, device=dev, dtype=diff.dtype),
             )
-            l_boundary = F.smooth_l1_loss(diff, target_diff, reduction="mean")
+
+            l_boundary = F.smooth_l1_loss(
+                diff,
+                target_diff,
+                reduction="mean",
+            )
         else:
-            l_boundary = torch.tensor(0.0, device=dev)
-        # ---- ★ [NEW] 逐时间步分类辅助 (类似 WDDR 的 aux_loss) ----
-        # targets 本身就是每个 link 的真实路况状态 (B, T)，有效值为 0~3，padding 为 -1
-        # cls_logits 是 (B, T, NUM_CLASSES)
-        # 直接 reshape 计算交叉熵，ignore_index=-1 会自动忽略 padding
+            l_boundary = zero
 
-        cls_logits_flat = cls_logits.reshape(-1, NUM_CLASSES)  # (B*T, 4)
-        targets_flat = targets.reshape(-1)  # (B*T,)
-
-        l_seq_cls = F.cross_entropy(
-            cls_logits_flat,
-            targets_flat,
-            ignore_index=self.ignore_index,
-            reduction='mean'
+        return (
+            l_ng,
+            l_ord,
+            l_cls,
+            l_bnd,
+            l_align,
+            l_sharp,
+            l_boundary,
+            l_seq_cls,
+            l_s4,
+            l_under,
         )
-
-
-        return l_ng, l_ord, l_cls, l_bnd, l_align, l_sharp, l_boundary , l_seq_cls
 
 
 # ================================================================
@@ -785,10 +904,19 @@ def evaluate_on_shards(model, shard_infos, device, criterion,
 
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                     lq1, lq2, lq3, cls_logits, bnd_logit, ng_logit = model(X_b, lens_b, gate_b)
+
                     if criterion is not None:
-                        l_ng, l_ord, _, _, _, _, _, _ = criterion(
-                            lq1, lq2, lq3, cls_logits, bnd_logit, ng_logit, y_b
+                        losses = criterion(
+                            lq1, lq2, lq3,
+                            cls_logits,
+                            bnd_logit,
+                            ng_logit,
+                            y_b,
                         )
+
+                        l_ng = losses[0]
+                        l_ord = losses[1]
+
                         total_loss += float(l_ng.item()) + float(l_ord.item())
 
                 probs, _, _ = model.get_cascade_probs(lq1, lq2, lq3, ng_logit, temperature=temperature)
@@ -1068,7 +1196,17 @@ def search_best_tau_and_temperature(model, val_shards, device, criterion,
 
     return best_tau, best_temp
 
+def _ramp_weight(base_w, start_epoch, ramp_epochs, epoch_idx):
+    # epoch_idx 是 0-based epoch
+    cur_epoch = epoch_idx + 1
 
+    if cur_epoch < int(start_epoch):
+        return 0.0
+
+    ramp_pos = (cur_epoch - int(start_epoch) + 1) / max(float(ramp_epochs), 1.0)
+    ramp = min(max(ramp_pos, 0.0), 1.0)
+
+    return float(base_w) * ramp
 # ================================================================
 # 9. 训练主函数
 # ================================================================
@@ -1217,12 +1355,20 @@ def train_wrc_from_shards(
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        t_loss_ng = t_loss_ord = t_loss_cls = t_loss_bnd = t_loss_align = t_loss_sharp = t_loss_boundary = t_loss_seq_cls = 0.0
+        t_loss_ng = t_loss_ord = t_loss_cls = t_loss_bnd = t_loss_align = t_loss_sharp = 0.0
+        t_loss_boundary = t_loss_seq_cls = t_loss_s4 = t_loss_under = 0.0
         nb = 0
         epoch_start = time.time()
 
         # warm-up: 前 WARMUP_EPOCHS 关闭 align 和 sharp (但 cls, bnd 保持)
-        disabled = {"align"} if epoch < WARMUP_EPOCHS else set()
+        disabled = set()
+
+# cls auxiliary 当前长期为 0，没有有效贡献，先禁用。
+        disabled.add("cls")
+
+        if epoch < WARMUP_EPOCHS:
+            disabled.add("align")
+        # disabled = {"align"} if epoch < WARMUP_EPOCHS else set()
         # 同时，boundary loss 也在前1个epoch关闭
         boundary_weight = 0.0 if epoch < 1 else BOUNDARY_WEIGHT
 
@@ -1288,7 +1434,7 @@ def train_wrc_from_shards(
 
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                     lq1, lq2, lq3, cls_logits, bnd_logit, ng_logit = model(X, lens, gate)
-                    l_ng, l_ord, l_cls, l_bnd, l_align, l_sharp, l_boundary, l_seq_cls = criterion(
+                    l_ng, l_ord, l_cls, l_bnd, l_align, l_sharp, l_boundary, l_seq_cls, l_s4, l_under = criterion(
                         lq1, lq2, lq3, cls_logits, bnd_logit, ng_logit, y
                     )
 
@@ -1308,8 +1454,35 @@ def train_wrc_from_shards(
                         aux_losses=aux_losses,
                         disabled_keys=disabled,
                     )
+                    from config import (
+                        S4_AUX_WEIGHT,
+                        S4_AUX_START_EPOCH,
+                        S4_AUX_RAMP_EPOCHS,
+                        UNDER_AUX_WEIGHT,
+                        UNDER_AUX_START_EPOCH,
+                        UNDER_AUX_RAMP_EPOCHS,
+                    )
 
-                    loss = aux_total + boundary_weight * l_boundary
+                    s4_w = _ramp_weight(
+                        S4_AUX_WEIGHT,
+                        S4_AUX_START_EPOCH,
+                        S4_AUX_RAMP_EPOCHS,
+                        epoch,
+                    )
+
+                    under_w = _ramp_weight(
+                        UNDER_AUX_WEIGHT,
+                        UNDER_AUX_START_EPOCH,
+                        UNDER_AUX_RAMP_EPOCHS,
+                        epoch,
+                    )
+
+                    loss = (
+                        aux_total
+                        + boundary_weight * l_boundary
+                        + s4_w * l_s4
+                        + under_w * l_under
+                    )
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     continue
@@ -1332,6 +1505,8 @@ def train_wrc_from_shards(
                 t_loss_sharp += float(l_sharp.item())
                 t_loss_boundary += float(l_boundary.item())
                 t_loss_seq_cls += float(l_seq_cls.item())
+                t_loss_s4 += float(l_s4.item())
+                t_loss_under += float(l_under.item())
                 nb += 1
 
                 if device.type == "cuda" and bi % 20 == 0:
@@ -1341,6 +1516,7 @@ def train_wrc_from_shards(
                         ng=f"{l_ng.item():.3f}",
                         ord=f"{l_ord.item():.3f}",
                         cls=f"{l_cls.item():.3f}",
+                        seq=f"{l_seq_cls.item():.3f}",
                         bnd=f"{l_bnd.item():.3f}",
                         gpu=f"{alloc:.1f}G",
                     )
@@ -1355,18 +1531,22 @@ def train_wrc_from_shards(
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-            if sc % 30 == 0:
+            if sc == 1 or sc % 10 == 0 or sc == len(shards):
                 elapsed = time.time() - epoch_start
                 log.info(
                     f"  [E{epoch+1} S{sc}/{len(shards)}] "
                     f"ng={t_loss_ng/nb:.4f} ord={t_loss_ord/nb:.4f} "
                     f"cls={t_loss_cls/nb:.4f} bnd={t_loss_bnd/nb:.4f} "
                     f"align={t_loss_align/nb:.4f} sharp={t_loss_sharp/nb:.4f} "
-                    f"boundary={t_loss_boundary/nb:.4f} | "
+                    f"boundary={t_loss_boundary/nb:.4f} "
+                    f"seq_cls={t_loss_seq_cls/nb:.4f} "
+                    f"s4={t_loss_s4/nb:.4f} under={t_loss_under/nb:.4f} | "
                     f"aux_w: cls={weight_info.get('cls',0):.3f} "
                     f"bnd={weight_info.get('bnd',0):.3f} "
                     f"align={weight_info.get('align',0):.3f} "
-                    f"sharp={weight_info.get('sharp',0):.3f} | "
+                    f"sharp={weight_info.get('sharp',0):.3f} "
+                    f"seq_cls={weight_info.get('seq_cls',0):.3f} | "
+                    f"s4_w={s4_w:.4f} under_w={under_w:.4f} | "
                     f"speed={nb/elapsed:.1f}b/s"
                 )
 
@@ -1376,13 +1556,17 @@ def train_wrc_from_shards(
 
         log.info(f"\n--- Epoch {epoch+1} Training ---")
         log.info(f"  Batches={nb:,} | Time={epoch_time:.0f}s | Speed={nb/max(epoch_time,1):.1f}b/s")
-        log.info(f"  ng={a(t_loss_ng):.4f} ord={a(t_loss_ord):.4f} "
-                 f"cls={a(t_loss_cls):.4f} bnd={a(t_loss_bnd):.4f} "
-                 f"align={a(t_loss_align):.4f} sharp={a(t_loss_sharp):.4f} "
-                 f"boundary={a(t_loss_boundary):.4f}")
+        log.info(
+            f"  ng={a(t_loss_ng):.4f} ord={a(t_loss_ord):.4f} "
+            f"cls={a(t_loss_cls):.4f} bnd={a(t_loss_bnd):.4f} "
+            f"align={a(t_loss_align):.4f} sharp={a(t_loss_sharp):.4f} "
+            f"boundary={a(t_loss_boundary):.4f} "
+            f"seq_cls={a(t_loss_seq_cls):.4f} "
+            f"s4={a(t_loss_s4):.4f} under={a(t_loss_under):.4f}"
+        )
 
         log.info(f"  Adaptive aux weights:")
-        for name in ["cls", "bnd", "align", "sharp"]:
+        for name in ["cls", "bnd", "align", "sharp", "seq_cls"]:
             log.info(f"    {name:>8s}: w={weight_info.get(name, 0):.4f} | rel_contrib={contrib_info.get(name, 0):.4f}")
 
         # 验证 (使用临时 τ=0.55, T=1.0)
@@ -1423,7 +1607,14 @@ def train_wrc_from_shards(
         writer.add_scalar("M/macro_f1", val["macro_f1"], epoch)
         writer.add_scalar("M/f1_s23", val["f1_s23"], epoch)
         writer.add_scalar("M/score", score, epoch)
-        for name in ["cls", "bnd", "align", "sharp"]:
+        writer.add_scalar("Loss/seq_cls", a(t_loss_seq_cls), epoch)
+
+        writer.add_scalar("Loss/s4", a(t_loss_s4), epoch)
+        writer.add_scalar("Loss/under", a(t_loss_under), epoch)
+        writer.add_scalar("AuxWeight/s4_static", s4_w, epoch)
+        writer.add_scalar("AuxWeight/under_static", under_w, epoch)
+
+        for name in ["cls", "bnd", "align", "sharp", "seq_cls"]:
             writer.add_scalar(f"AuxWeight/{name}", weight_info.get(name, 0), epoch)
 
         save_training_checkpoint(
@@ -1544,8 +1735,12 @@ def load_wrc_model(path, device=None):
 # ================================================================
 
 def predict_proba_wrc(model, df, max_seq_len=WRC_MAX_SEQ_LEN,
-                      batch_size=512, device=None,
+                      batch_size=None, device=None,
                       temperature=None):
+    from config import WRC_INFER_BATCH_SIZE
+
+    if batch_size is None:
+        batch_size = int(WRC_INFER_BATCH_SIZE)
     if device is None: device = DEVICE
     model.eval();
     model.to(device)
