@@ -88,6 +88,20 @@ STAGE2_ALL_COLS = [
 
 ]
 
+
+
+STAGE3_REALIZED_TARGET_COLS = [
+    "target_actual_s4_any",
+    "target_actual_s4_exposure",
+    "target_actual_cong_exposure",
+    "target_actual_max_status",
+    "target_serious_underestimate",
+    "target_s4_underestimate",
+    "target_under_score",
+    "target_path_nll",
+    "target_path_len",
+]
+
 log = get_logger()
 
 
@@ -484,6 +498,137 @@ def compute_weather_features(head_batch: pd.DataFrame) -> pd.DataFrame:
 
     return df[['order_id', 'day', 'weather_severity', 'is_extreme_weather',
                'temp_avg', 'temp_range', 'is_high_temp', 'is_low_temp']]
+##
+import numpy as np
+import pandas as pd
+
+
+def build_realized_stage3_targets(link_level_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construct order-level realized targets for Stage3-v2.
+
+    Required:
+      order_id, day, link_arrival_status
+
+    Optional but strongly recommended:
+      pred_p1, pred_p2, pred_p3, pred_p4, pred_status
+
+    Output:
+      one row per (order_id, day)
+    """
+
+    df = link_level_df.copy()
+
+    if "order_id" not in df.columns or "day" not in df.columns:
+        raise ValueError("link_level_df must contain order_id and day.")
+
+    actual_col = None
+    for c in ["link_arrival_status", "actual_status", "y_true", "status_true"]:
+        if c in df.columns:
+            actual_col = c
+            break
+
+    if actual_col is None:
+        raise ValueError(
+            "Cannot build realized targets: missing link_arrival_status / actual_status."
+        )
+
+    y = pd.to_numeric(df[actual_col], errors="coerce")
+
+    # 兼容 0/1/2/3 和 1/2/3/4 两种编码
+    valid = y.notna()
+    if valid.sum() == 0:
+        raise ValueError("No valid actual status values.")
+
+    y_valid_min = int(y[valid].min())
+    y_valid_max = int(y[valid].max())
+
+    if y_valid_min >= 0 and y_valid_max <= 3:
+        y_status = y + 1
+    else:
+        y_status = y
+
+    y_status = y_status.clip(lower=1, upper=4).astype("float32")
+    df["_actual_status_1to4"] = y_status
+
+    # ---- predicted probabilities ----
+    pcols = ["pred_p1", "pred_p2", "pred_p3", "pred_p4"]
+    has_probs = all(c in df.columns for c in pcols)
+
+    if has_probs:
+        p = df[pcols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype("float64")
+        p = np.clip(p, 1e-8, 1.0)
+        p = p / p.sum(axis=1, keepdims=True).clip(min=1e-8)
+
+        df["_pred_expected_status"] = (
+            1.0 * p[:, 0] +
+            2.0 * p[:, 1] +
+            3.0 * p[:, 2] +
+            4.0 * p[:, 3]
+        ).astype("float32")
+
+        df["_pred_status_1to4"] = (np.argmax(p, axis=1) + 1).astype("int16")
+
+        actual_idx = (df["_actual_status_1to4"].astype(int).values - 1).clip(0, 3)
+        df["_link_nll"] = (-np.log(p[np.arange(len(df)), actual_idx].clip(min=1e-8))).astype("float32")
+    else:
+        df["_pred_expected_status"] = np.nan
+        df["_link_nll"] = np.nan
+
+        if "pred_status" in df.columns:
+            pred_status = pd.to_numeric(df["pred_status"], errors="coerce")
+            if pred_status.min() >= 0 and pred_status.max() <= 3:
+                pred_status = pred_status + 1
+            df["_pred_status_1to4"] = pred_status.clip(1, 4)
+        else:
+            df["_pred_status_1to4"] = np.nan
+
+    # ---- realized severe exposure ----
+    df["_actual_s4"] = (df["_actual_status_1to4"] >= 4).astype("float32")
+    df["_actual_cong"] = (df["_actual_status_1to4"] >= 3).astype("float32")
+
+    # ---- underestimation targets ----
+    if df["_pred_expected_status"].notna().any():
+        df["_under_gap"] = np.maximum(
+            df["_actual_status_1to4"] - df["_pred_expected_status"],
+            0.0,
+        ).astype("float32")
+    else:
+        df["_under_gap"] = np.nan
+
+    df["_serious_underestimate"] = (
+        (df["_actual_status_1to4"] >= 4) &
+        (df["_pred_status_1to4"].notna()) &
+        (df["_pred_status_1to4"] <= 2)
+    ).astype("float32")
+
+    df["_s4_underestimate"] = (
+        (df["_actual_status_1to4"] >= 4) &
+        (df["_pred_status_1to4"].notna()) &
+        (df["_pred_status_1to4"] < 4)
+    ).astype("float32")
+
+    agg = df.groupby(["order_id", "day"], sort=False).agg(
+        target_actual_s4_any=("_actual_s4", "max"),
+        target_actual_s4_exposure=("_actual_s4", "mean"),
+        target_actual_cong_exposure=("_actual_cong", "mean"),
+        target_actual_max_status=("_actual_status_1to4", "max"),
+        target_serious_underestimate=("_serious_underestimate", "max"),
+        target_s4_underestimate=("_s4_underestimate", "max"),
+        target_under_score=("_under_gap", "mean"),
+        target_path_nll=("_link_nll", "mean"),
+        target_path_len=("_actual_status_1to4", "count"),
+    ).reset_index()
+
+    # 避免全 NaN 影响后续模型
+    for c in [
+        "target_under_score",
+        "target_path_nll",
+    ]:
+        if c in agg.columns:
+            agg[c] = agg[c].fillna(0.0)
+
+    return agg
 # ================================================================
 # 特征列定义（Stage 3 使用）
 # ================================================================

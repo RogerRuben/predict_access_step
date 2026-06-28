@@ -38,7 +38,9 @@ from stage2_assess import (
     compute_night,
     compute_markov_features,
     compute_weather_features,
+    build_realized_stage3_targets,
     STAGE2_ALL_COLS,
+    STAGE3_REALIZED_TARGET_COLS,
 )
 from logger import get_logger
 from config import USE_KFOLD, KFOLD_SPLITS, KFOLD_SEED
@@ -543,11 +545,35 @@ def _process_day_stage2(
         weather = compute_weather_features(head_b)
 
         # 合并所有订单级特征
+        # 合并所有订单级特征
         merged = det.merge(unc, on=['order_id', 'day'], how='outer')
         merged = merged.merge(risk, on=['order_id', 'day'], how='outer')
         merged = merged.merge(night, on=['order_id', 'day'], how='outer')
         merged = merged.merge(markov, on=['order_id', 'day'], how='outer')
         merged = merged.merge(weather, on=['order_id', 'day'], how='outer')
+
+        # ★ Stage3-v2 realized targets:
+        # 从 link-level actual status + Stage1 predicted probabilities 聚合订单级监督标签
+        stage3_targets = build_realized_stage3_targets(link_with_pred)
+
+        merged = merged.merge(
+            stage3_targets,
+            on=["order_id", "day"],
+            how="left",
+        )
+
+        missing_target_rate = (
+            merged["target_actual_s4_any"].isna().mean()
+            if "target_actual_s4_any" in merged.columns
+            else 1.0
+        )
+
+        if missing_target_rate > 0.05:
+            raise RuntimeError(
+                f"Day {day}: Stage3-v2 target missing rate too high: "
+                f"{missing_target_rate:.2%}. "
+                f"Check order_id/day consistency between merged and link_with_pred."
+            )
 
         s2_parts.append(merged)
         print(f"head_b columns: {head_b.columns.tolist()}")
@@ -964,6 +990,7 @@ def _make_stage3_v2_input(df, s2_cols):
     keep_cols += [c for c in base_cols if c in out.columns]
     keep_cols += [c for c in s2_cols if c in out.columns]
     keep_cols += [c for c in extra_cols if c in out.columns]
+    keep_cols += [c for c in STAGE3_REALIZED_TARGET_COLS if c in out.columns]
     keep_cols = _dedup_keep_order(keep_cols)
 
     if len([c for c in s2_cols if c in out.columns]) < 8:
@@ -1144,6 +1171,30 @@ def run_pipeline(mode: str = "train"):
     test_s2 = pd.concat(test_s2_list, ignore_index=True) if test_s2_list else pd.DataFrame()
     test_head_slim = pd.concat(test_head_list, ignore_index=True) if test_head_list else pd.DataFrame()
 
+    # ---- Stage3-v2 realized target check ----
+    def _check_stage3_realized_targets(df, name):
+        missing = [c for c in STAGE3_REALIZED_TARGET_COLS if c not in df.columns]
+        if missing:
+            log.warning(
+                f"[Stage3-v2] {name}: missing realized target columns: {missing}. "
+                f"Stage3-v2 real mode will fail; proxy mode would be required."
+            )
+        else:
+            msg = {}
+            for c in [
+                "target_actual_s4_any",
+                "target_serious_underestimate",
+                "target_s4_underestimate",
+            ]:
+                msg[c] = float(pd.to_numeric(df[c], errors="coerce").mean())
+            log.info(f"[Stage3-v2] {name}: realized targets available | rates={msg}")
+
+    if mode == "train" and not train_s2.empty:
+        _check_stage3_realized_targets(train_s2, "train_s2")
+
+    if not test_s2.empty:
+        _check_stage3_realized_targets(test_s2, "test_s2")
+        
     # ---- Stage 3 前硬检查 ----
     if mode == "train" and train_s2.empty:
         raise RuntimeError("train_s2 is empty. Cannot train Stage 3.")
